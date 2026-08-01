@@ -1,0 +1,29 @@
+# Keil MDK output
+Output/
+Objects/
+Listings/
+*.axf
+*.hex
+*.bin
+*.o
+*.d
+*.dep
+*.htm
+*.map
+*.sct
+*.lnp
+*.uvguix.*
+*.uvoptx
+*.JLinkLog
+*.ini
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
