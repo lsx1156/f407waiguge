@@ -123,3 +123,26 @@ uint8_t sram_test(void)
 
     return 0;
 }
+
+/**
+ * @brief       Test function: write 1 byte to SRAM
+ * @param       addr: address to write
+ * @param       data: byte to write
+ * @retval      none
+ */
+void sram_test_write(uint32_t addr, uint8_t data)
+{
+    sram_write(&data, addr, 1);
+}
+
+/**
+ * @brief       Test function: read 1 byte from SRAM
+ * @param       addr: address to read
+ * @retval      read byte
+ */
+uint8_t sram_test_read(uint32_t addr)
+{
+    uint8_t data;
+    sram_read(&data, addr, 1);
+    return data;
+}

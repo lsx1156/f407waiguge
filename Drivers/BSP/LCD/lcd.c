@@ -594,34 +594,13 @@ void lcd_set_window(uint16_t sx, uint16_t sy, uint16_t width, uint16_t height)
 }
 
 /**
- * @brief       SRAM底层驱动，时钟使能，引脚分配
- * @note        此函数会被HAL_SRAM_Init()调用,初始化读写总线引脚
- * @param       hsram:SRAM句柄
- * @retval      无
+/**
+ * @brief       SRAM MSP init
+ * @note        Moved to stm32f4xx_hal_msp.c to avoid duplicate symbol
+ * @param       hsram: SRAM handle
+ * @retval      None
  */
-void HAL_SRAM_MspInit(SRAM_HandleTypeDef *hsram)
-{
-    GPIO_InitTypeDef gpio_init_struct;
-
-    __HAL_RCC_FSMC_CLK_ENABLE();            /* 使能FSMC时钟 */
-    __HAL_RCC_GPIOD_CLK_ENABLE();           /* 使能GPIOD时钟 */
-    __HAL_RCC_GPIOE_CLK_ENABLE();           /* 使能GPIOE时钟 */
-
-    /* 初始化PD0,1, 8,9,10,14,15 */
-    gpio_init_struct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_8 \
-                           | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_14 | GPIO_PIN_15;
-    gpio_init_struct.Mode = GPIO_MODE_AF_PP;            /* 推挽复用 */
-    gpio_init_struct.Pull = GPIO_PULLUP;                /* 上拉 */
-    gpio_init_struct.Speed = GPIO_SPEED_FREQ_HIGH;      /* 高速 */
-    gpio_init_struct.Alternate = GPIO_AF12_FSMC;        /* 复用为FSMC */
-
-    HAL_GPIO_Init(GPIOD, &gpio_init_struct);            /* 初始化 */
-
-    /* 初始化PE7,8,9,10,11,12,13,14,15 */
-    gpio_init_struct.Pin = GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 \
-                           | GPIO_PIN_11 | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
-    HAL_GPIO_Init(GPIOE, &gpio_init_struct);
-}
+/* HAL_SRAM_MspInit moved to stm32f4xx_hal_msp.c */
 
 /**
  * @brief       初始化LCD

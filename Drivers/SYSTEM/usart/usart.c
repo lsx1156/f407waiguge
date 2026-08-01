@@ -122,38 +122,13 @@ void usart_init(uint32_t baudrate)
 }
 
 /**
- * @brief       UART底层初始化函数
- * @param       huart: UART句柄类型指针
- * @note        此函数会被HAL_UART_Init()调用
- *              完成时钟使能，引脚配置，中断配置
- * @retval      无
+/**
+ * @brief       UART MSP init
+ * @note        Moved to stm32f4xx_hal_msp.c to avoid duplicate symbol
+ * @param       huart: UART handle
+ * @retval      None
  */
-void HAL_UART_MspInit(UART_HandleTypeDef *huart)
-{
-    GPIO_InitTypeDef gpio_init_struct;
-    if(huart->Instance == USART_UX)                             /* 如果是串口1，进行串口1 MSP初始化 */
-    {
-        USART_UX_CLK_ENABLE();                                  /* USART1 时钟使能 */
-        USART_TX_GPIO_CLK_ENABLE();                             /* 发送引脚时钟使能 */
-        USART_RX_GPIO_CLK_ENABLE();                             /* 接收引脚时钟使能 */
-
-        gpio_init_struct.Pin = USART_TX_GPIO_PIN;               /* TX引脚 */
-        gpio_init_struct.Mode = GPIO_MODE_AF_PP;                /* 复用推挽输出 */
-        gpio_init_struct.Pull = GPIO_PULLUP;                    /* 上拉 */
-        gpio_init_struct.Speed = GPIO_SPEED_FREQ_HIGH;          /* 高速 */
-        gpio_init_struct.Alternate = USART_TX_GPIO_AF;          /* 复用为USART1 */
-        HAL_GPIO_Init(USART_TX_GPIO_PORT, &gpio_init_struct);   /* 初始化发送引脚 */
-
-        gpio_init_struct.Pin = USART_RX_GPIO_PIN;               /* RX引脚 */
-        gpio_init_struct.Alternate = USART_RX_GPIO_AF;          /* 复用为USART1 */
-        HAL_GPIO_Init(USART_RX_GPIO_PORT, &gpio_init_struct);   /* 初始化接收引脚 */
-
-#if USART_EN_RX
-        HAL_NVIC_EnableIRQ(USART_UX_IRQn);                      /* 使能USART1中断通道 */
-        HAL_NVIC_SetPriority(USART_UX_IRQn, 3, 3);              /* 抢占优先级3，子优先级3 */
-#endif
-    }
-}
+/* HAL_UART_MspInit moved to stm32f4xx_hal_msp.c */
 
 /**
  * @brief       Rx传输回调函数
@@ -200,22 +175,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 
 /**
- * @brief       串口1中断服务函数
- * @param       无
- * @retval      无
+/**
+ * @brief       USART1 IRQ handler
+ * @note        Moved to stm32f4xx_it.c to avoid duplicate symbol
+ * @param       None
+ * @retval      None
  */
-void USART_UX_IRQHandler(void)
-{ 
-#if SYS_SUPPORT_OS                              /* 使用OS */
-    OSIntEnter();    
-#endif
-
-    HAL_UART_IRQHandler(&g_uart1_handle);       /* 调用HAL库中断处理公用函数 */
-
-#if SYS_SUPPORT_OS                              /* 使用OS */
-    OSIntExit();
-#endif
-}
+/* USART1_IRQHandler moved to stm32f4xx_it.c */
 
 #endif
 

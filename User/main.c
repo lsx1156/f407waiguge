@@ -2,12 +2,17 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body - 集成IDE业务逻辑+LCD状态显示
+  * @brief          : Main program body - v0.1 基础版(外置SRAM+LCD硬件资源展示)
   ******************************************************************************
   */
 /* USER CODE END Header */
 
+/* ===== 功能开关：定义V01_BASIC_ONLY则只保留v0.1基础功能(SRAM+LCD) ===== */
+#define V01_BASIC_ONLY
+/* ========================================================================== */
+
 /* Includes ------------------------------------------------------------------*/
+#ifndef V01_BASIC_ONLY
 #include "main.h"
 #include "bsp_config.h"
 #include "contract.h"
@@ -22,6 +27,7 @@
 #include "eeprom.h"
 #include "interpolation.h"
 #include "safety.h"
+#endif
 
 #include "./SYSTEM/sys/sys.h"
 #include "./SYSTEM/usart/usart.h"
@@ -30,8 +36,10 @@
 #include "./BSP/LCD/lcd.h"
 #include "./BSP/KEY/key.h"
 #include "./BSP/SRAM/sram.h"
+#ifndef V01_BASIC_ONLY
 #include "./BSP/SYS_INFO/sys_info.h"
 #include "./BSP/LCD_STATUS/lcd_status.h"
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +47,7 @@
 void MPU_Config(void);
 
 /* Private variables ---------------------------------------------------------*/
+#ifndef V01_BASIC_ONLY
 CAN_HandleTypeDef hcan1;
 CAN_HandleTypeDef hcan2;
 I2C_HandleTypeDef hi2c1;
@@ -47,13 +56,16 @@ SRAM_HandleTypeDef hsram1;
 ETH_HandleTypeDef heth;
 UART_HandleTypeDef huart1;
 IWDG_HandleTypeDef hiwdg;
+#endif
 
 /* Private function prototypes -----------------------------------------------*/
 HAL_StatusTypeDef SystemClock_Config(void);
+#ifndef V01_BASIC_ONLY
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_IWDG_Init(void);
 static void early_uart_init(void);
+#endif
 
 /* Private user code ---------------------------------------------------------*/
 int __io_putchar(int ch)
@@ -248,6 +260,111 @@ void Error_Handler(void)
     }
 }
 
+/* ===== v0.1 基础功能: 外置SRAM测试 ===== */
+/* 测试缓冲区, 起始地址为: SRAM_BASE_ADDR */
+#if (__ARMCC_VERSION >= 6010050)
+uint32_t g_test_buffer[250000] __attribute__((section(".bss.ARM.__at_0x68000000")));
+#else
+uint32_t g_test_buffer[250000] __attribute__((at(SRAM_BASE_ADDR)));
+#endif
+
+/**
+ * @brief       外部内存测试(最多支持1M字节内存测试)
+ * @param       x: LCD显示x坐标
+ * @param       y: LCD显示y坐标
+ * @retval      无
+ */
+void fsmc_sram_test(uint16_t x, uint16_t y)
+{
+    uint32_t i = 0;
+    uint8_t temp = 0;
+    uint8_t sval = 0;
+
+    lcd_show_string(x, y, 239, y + 16, 16, "Ex Memory Test:   0KB", BLUE);
+
+    for (i = 0; i < 1024 * 1024; i += 4096)
+    {
+        sram_write(&temp, i, 1);
+        temp++;
+    }
+
+    for (i = 0; i < 1024 * 1024; i += 4096)
+    {
+        sram_read(&temp, i, 1);
+
+        if (i == 0)
+        {
+            sval = temp;
+        }
+        else if (temp <= sval)
+        {
+            break;
+        }
+
+        lcd_show_xnum(x + 15 * 8, y, (uint16_t)(temp - sval + 1) * 4, 4, 16, 0, BLUE);
+    }
+}
+
+/* ===== main函数: 根据V01_BASIC_ONLY宏切换版本 ===== */
+#ifdef V01_BASIC_ONLY
+/* v0.1 基础版本: 外置SRAM + LCD硬件资源展示 */
+int main(void)
+{
+    uint8_t key;
+    uint8_t i = 0;
+    uint32_t ts = 0;
+
+    HAL_Init();
+    sys_stm32_clock_init(336, 25, 2, 7);
+    delay_init(168);
+    usart_init(115200);
+    led_init();
+    lcd_init();
+    key_init();
+    sram_init();
+
+    lcd_show_string(30,  50, 200, 16, 16, "STM32", RED);
+    lcd_show_string(30,  70, 200, 16, 16, "SRAM TEST", RED);
+    lcd_show_string(30,  90, 200, 16, 16, "ATOM@MZXQ", RED);
+    lcd_show_string(30, 110, 200, 16, 16, "KEY0:Test Sram", RED);
+    lcd_show_string(30, 130, 200, 16, 16, "KEYUP:TEST Data", RED);
+
+    for (ts = 0; ts < 250000; ts++)
+    {
+        g_test_buffer[ts] = ts;
+    }
+
+    while (1)
+    {
+        key = key_scan();
+
+        if (key == KEY0_PRES)
+        {
+            fsmc_sram_test(30, 150);
+        }
+        else if (key == WKUP_PRES)
+        {
+            for (ts = 0; ts < 250000; ts++)
+            {
+                lcd_show_xnum(30, 170, g_test_buffer[ts], 6, 16, 0, BLUE);
+            }
+        }
+        else
+        {
+            delay_ms(10);
+        }
+
+        i++;
+
+        if (i == 20)
+        {
+            i = 0;
+            LED0_TOGGLE();
+        }
+    }
+}
+#else
+/* 完整功能版本: 外骨骼控制系统 */
 int main(void)
 {
     /* ★★★ 极早喂狗：防 Option Bytes IWDG_HW=1 导致 128ms 复位循环 ★★★ */
@@ -444,3 +561,4 @@ int main(void)
         }
     }
 }
+#endif /* V01_BASIC_ONLY */
