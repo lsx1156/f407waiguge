@@ -17,6 +17,7 @@ extern JointStatus_t g_leg_status[2];
 extern JointStatus_t g_arm_status[4];
 extern ABOState_t    g_abo_state[6];          /* v1.7: 工业负载估计器需要访问 */
 extern int32_t       g_abo_assist_torque[6];  /* v1.7: ZERO 模式清零需要 */
+extern volatile float g_gait_phase;           /* AO 步态相位 0.0~1.0, control_isr.c 定义 */
 
 void control_isr_init(void);
 void control_isr_process(void);

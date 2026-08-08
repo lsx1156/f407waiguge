@@ -94,6 +94,27 @@ static int32_t torque_compensate(int32_t target, int32_t velocity,
     return target + damping + friction + ff;
 }
 
+/* ★ fix(安全): 上肢 ±90°(相对机械零位) 软限位回复力矩
+ *   模式切换/失力时手臂可能因重力或惯性甩过极限。软限位在 90°~105° 软带内
+ *   线性增大回复力矩至 1.5 N·m, 把手臂温和拉回, 避免硬碰撞或甩过零位过暴力。
+ *   限位内返回 0 (不影响透明跟随/助力)。pos_mdeg: 关节位置 (mdeg, 0=机械零位)。 */
+static int32_t arm_soft_limit_torque(int32_t pos_mdeg)
+{
+    const int32_t LIMIT_MDEG  = 90000;   /* 90° = 90000 mdeg */
+    const int32_t SOFT_BAND   = 15000;   /* 15° 软带: 90°→105° 线性增至满力矩 */
+    const int32_t MAX_TAU_MNM = 1500;    /* 1.5 N·m 回复力矩上限 */
+    if (pos_mdeg > LIMIT_MDEG) {
+        int32_t over = pos_mdeg - LIMIT_MDEG;
+        if (over > SOFT_BAND) over = SOFT_BAND;
+        return -(MAX_TAU_MNM * over / SOFT_BAND);   /* 位置正超限 → 负向拉回 */
+    } else if (pos_mdeg < -LIMIT_MDEG) {
+        int32_t over = -pos_mdeg - LIMIT_MDEG;
+        if (over > SOFT_BAND) over = SOFT_BAND;
+        return  (MAX_TAU_MNM * over / SOFT_BAND);   /* 位置负超限 → 正向拉回 */
+    }
+    return 0;
+}
+
 /**
  * @brief  ABO 观测器单关节更新 (运行在 1ms ISR)
  *
@@ -116,8 +137,16 @@ static void abo_update_one(uint8_t idx, JointStatus_t *js, JointCommand_t *cmd)
     ABOState_t *abo = &g_abo_state[idx];
     if (!abo->enable) return;
 
-    /* 1. 实时测量力矩 (mNm, 电机编码器推算) */
+    /* 1. 实时测量力矩 (mNm, 电机相电流推算) */
     int32_t tau_meas = js->torque;
+
+    /* ★ fix(安全): 扣除 ABO 上一周期下发的助力, 得到「外部力矩」再做偏置/带通。
+     *   原代码直接对 tau_meas 做 HPF → assist→命令→tau_meas→HPF→tau_human→assist
+     *   构成正反馈; 工业模式 gain=1.0 + bias leak≈60s → 环路增益≈1 → 电机狂转。
+     *   扣除后: 稳态 tau_meas≈命令 → 残差≈0, 仅外部扰动 transient 通过, 保证稳定。
+     *   g_abo_assist_torque[idx] 在上周期末写入, 本周期初即「上周期 assist」。
+     *   偏置也随之只跟踪外部(重力/摩擦)力矩, 不再吞掉自身 assist, 行为更正确。 */
+    tau_meas -= g_abo_assist_torque[idx];
 
     if (abo->industrial_mode) {
         /* ========== v1.7: 工业模式 ==========
@@ -559,8 +588,14 @@ static void local_cmd_generate(JointCommand_t cmd[6])
                 float K = is_shoulder ? (0.3f + 1.2f * phase_gain) : (0.1f + 0.7f * phase_gain);
                 float B = is_shoulder ? (0.2f + 1.0f * phase_gain) : (0.05f + 0.3f * phase_gain);
 
-                /* 阻抗力矩 (Nm → mNm): τ = K(ref-pos) + B(0-vel) */
-                float tau_imp = (K * (ref - pos_rad) + B * (0.0f - vel_rad)) * 1000.0f;
+                /* ★ fix(方向): 臂电机正方向 = 解剖反方向 (4 臂关节全部反相, 用户确认)。
+                 *   阻抗在解剖系定义: τ_a = K(ref_a - pos_a) - B·vel_a。
+                 *   坐标变换 pos_a = S·pos_m, τ_m = S·τ_a (S=-1) → S²=1 使 pos/vel 项不变,
+                 *   仅 ref 项乘 S: τ_m = K(S·ref_a - pos_m) - B·vel_m。
+                 *   故 ref 取反。ABO 测量/命令同在电机系, S 自动抵消, 无需改动。 */
+                const float ARM_DIR = -1.0f;
+                /* 阻抗力矩 (Nm → mNm): τ = K(S·ref - pos) + B(0 - vel) */
+                float tau_imp = (K * (ARM_DIR * ref - pos_rad) + B * (0.0f - vel_rad)) * 1000.0f;
 
                 /* 3) 合成 + 限幅 (mNm)
                  * ★ v1.6.9fix2: 限幅从 ±2000 降到 ±500 (0.5 N·m), 防止大力矩对抗用户 */
@@ -936,10 +971,14 @@ void control_isr_process(void)
         int32_t tlimit = pp->torque_limit;
 
         if (mode == CTRL_MODE_TORQUE || mode == CTRL_MODE_MIXED) {
-            /* ★ v1.6.8fix2: ZERO_TORQUE 模式直接发零力矩, 跳过 rate_limit/compensate */
+            /* ★ fix(安全): ±90° 软限位回复力矩 (限位内为 0, 不影响透明/助力) */
+            int32_t soft = arm_soft_limit_torque(g_arm_status[i].position);
+            /* ★ v1.6.8fix2: ZERO_TORQUE 模式直接发力矩, 跳过 rate_limit/compensate
+             *   (软限位回复力矩直接发出; 限位内 soft=0, 保持透明) */
             if (mode_get_local_mode() == 0) {
-                push_can_tx(1, joint_id, 0, CTRL_MODE_TORQUE);
+                push_can_tx(1, joint_id, soft, CTRL_MODE_TORQUE);
             } else {
+                target += soft;
                 target = torque_rate_limit(g_arm_status[i].torque, target,
                                           rate_limit ? rate_limit : 5000, CONTROL_PERIOD_ARM);
                 target = torque_compensate(target, g_arm_status[i].velocity,

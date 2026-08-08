@@ -154,6 +154,9 @@ typedef struct {
     float global_adm_scale;
 } JointUnitState_t;
 
+/* ===== 关节总数 (2 腿 + 4 臂) ===== */
+#define JOINT_COUNT         MOTOR_COUNT_TOTAL
+
 /* 全局单关节实例数组 (每关节一个) */
 extern JointUnitState_t g_joint_state[JOINT_COUNT];
 
@@ -180,9 +183,6 @@ typedef struct {
     /* ---- 新增: 指向零 IMU 漂移状态 (非 wire-format) ---- */
     JointUnitState_t *state;         /* -> g_joint_state[idx] */
 } JointUnit_t;
-
-/* ===== 关节总数 (2 腿 + 4 臂) ===== */
-#define JOINT_COUNT         MOTOR_COUNT_TOTAL
 
 /* 配置表 (唯一身份/硬件映射来源) */
 extern const JointUnit_t g_joint[JOINT_COUNT];
