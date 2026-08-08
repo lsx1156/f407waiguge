@@ -148,6 +148,10 @@ void *memp_malloc(memp_t type);
 #endif
 void  memp_free(memp_t type, void *mem);
 
+/* Sanitize UDP PCB pool callbacks (recv/recv_arg) to prevent
+ * stale pointers from IWDG soft-reset causing HardFault. */
+void  memp_udp_pcb_pool_sanitize(void);
+
 #ifdef __cplusplus
 }
 #endif

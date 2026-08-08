@@ -17,7 +17,8 @@ void     safe_cmd_write(JointCommand_t *new_cmd);
 uint8_t  safe_cmd_read(JointCommand_t *out_cmd);
 uint32_t safe_cmd_get_version(void);
 
-#define COMM_HEARTBEAT_TIMEOUT_MS   50
+#define COMM_HEARTBEAT_TIMEOUT_MS   200     /* 放宽到 200ms: 上位机 20~50ms/帧 + 网络抖动/ARP/交换机转发 */
+#define COMM_HEARTBEAT_MISS_CNT     3       /* 连续 3 次检查超时才判故障，避免偶发丢包误触发 */
 extern volatile uint32_t g_last_comm_ts;
 void     comm_heartbeat_kick(void);
 uint8_t  comm_is_heartbeat_ok(void);

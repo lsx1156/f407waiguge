@@ -24,7 +24,11 @@ ALIGN4 uint8_t  g_eth_tx_buf[ETH_TXBUFNB][ETH_TX_BUF_SIZE];
 uint8_t ethernet_init(void)
 {
     g_eth_handle.Instance = ETH;
-    g_eth_handle.Init.AutoNegotiation = ETH_AUTONEGOTIATION_ENABLE;
+    /* v1.5: 禁用自动协商, 用固定 100M/全双工.
+     * 原因: HAL_ETH_Init 启用自动协商时会阻塞等待链路(5s)+协商完成(5s),
+     *   没插网线就卡 10 秒, 拖垮主循环和喂狗.
+     *   链路状态后续由主循环 ethernetif_check_link_status() 轮询检测. */
+    g_eth_handle.Init.AutoNegotiation = ETH_AUTONEGOTIATION_DISABLE;
     g_eth_handle.Init.Speed = ETH_SPEED_100M;
     g_eth_handle.Init.DuplexMode = ETH_MODE_FULLDUPLEX;
     g_eth_handle.Init.PhyAddress = 0;
@@ -35,17 +39,13 @@ uint8_t ethernet_init(void)
 
     if (HAL_ETH_Init(&g_eth_handle) != HAL_OK)
     {
+        printf("[ETH] HAL_ETH_Init FAILED (MAC config)\r\n");
         return 1;
     }
-
-    HAL_ETH_DMATxDescListInit(&g_eth_handle, g_eth_dma_tx_dscr_tab, &g_eth_tx_buf[0][0], ETH_TXBUFNB);
-    HAL_ETH_DMARxDescListInit(&g_eth_handle, g_eth_dma_rx_dscr_tab, &g_eth_rx_buf[0][0], ETH_RXBUFNB);
-
-    /* Start ETH MAC/DMA after init */
-    if (HAL_ETH_Start(&g_eth_handle) != HAL_OK)
-    {
-        return 2;
-    }
+    printf("[ETH] HAL_ETH_Init OK (PhyAddr=0, 100M/Full, no-autoneg)\r\n");
+    printf("[ETH] SYSCFG_PMC=0x%08lX (RMII_SEL=%s)\r\n",
+           (unsigned long)SYSCFG->PMC,
+           (SYSCFG->PMC & SYSCFG_PMC_MII_RMII_SEL) ? "RMII" : "MII");
 
     return 0;
 }

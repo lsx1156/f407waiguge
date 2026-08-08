@@ -11,18 +11,28 @@
 
 #define MEM_SIZE                    (64*1024)
 
-#define MEM_LIBC_MALLOC             1
+/* LWIP heap 放在外部 SRAM: 0x68020000 */
+#define LWIP_RAM_HEAP_POINTER       ((void *)(0x68020000))
+
+#define MEM_LIBC_MALLOC             0
+#define MEMP_MEM_MALLOC             0
 
 #define LWIP_ALLOW_MEM_FREE         1
 
-#define MEMP_NUM_PBUF               32
-#define MEMP_NUM_UDP_PCB            4
+/* ★★★ 关键修复: 强制 MEMP 池初始化时清零 (memset) ★★★
+ * STM32 IWDG 软复位不清内部 RAM .bss, MEMP 静态池 (UDP PCB/PBUF 等)
+ * 保留上次崩溃的脏数据 (如 recv=0x6806C666). 启用此选项后 memp_init_pool()
+ * 会对所有池内存执行 memset(0), 确保从干净状态开始. */
+#define MEMP_MEM_INIT                1
+
+#define MEMP_NUM_PBUF               16    /* v1.6.3+fix2: 8→16, 留足UDP发送缓存余量防266s无上报 */
+#define MEMP_NUM_UDP_PCB            4     /* v1.6.3+fix: 8→4, 只有1个上位机UDP */
 #define MEMP_NUM_TCP_PCB            0
 #define MEMP_NUM_TCP_PCB_LISTEN     0
 #define MEMP_NUM_TCP_SEG            0
 #define MEMP_NUM_SYS_TIMEOUT        8
 
-#define PBUF_POOL_SIZE              32
+#define PBUF_POOL_SIZE              16    /* v1.6.3+fix2: 8→16, 原8太小导致UDP pbuf_alloc失败发不出上报，留足余量（原32太大栈溢出，取16折中，节省~24KB内部RAM） */
 #define PBUF_POOL_BUFSIZE           LWIP_MEM_ALIGN_SIZE(TCP_MSS+40+PBUF_LINK_ENCAPSULATION_HLEN+PBUF_LINK_HLEN)
 
 #define LWIP_TCP                    0

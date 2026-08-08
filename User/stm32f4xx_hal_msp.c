@@ -182,6 +182,20 @@ void HAL_ETH_MspInit(ETH_HandleTypeDef* heth)
         __HAL_RCC_GPIOA_CLK_ENABLE();
         __HAL_RCC_GPIOC_CLK_ENABLE();
         __HAL_RCC_GPIOG_CLK_ENABLE();
+        __HAL_RCC_GPIOD_CLK_ENABLE();   /* ETH_RESET on PD3 */
+
+        /* PD3: ETH PHY RESET (output) */
+        GPIO_InitStruct.Pin = GPIO_PIN_3;
+        GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+        /* PHY hardware reset - critical for REF_CLK stability */
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_RESET);
+        HAL_Delay(100);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_3, GPIO_PIN_SET);
+        HAL_Delay(200);
 
         /* PA1: REF_CLK, PA2: MDIO, PA7: CRS_DV */
         GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_7;
@@ -275,9 +289,9 @@ static void HAL_FSMC_MspInit(void)
                            GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
     HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
-    /* GPIOG: A10/A11/A12
-       PG0=A10, PG1=A11, PG2=A12 */
-    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2;
+    /* GPIOG: A10/A11/A12/A13/A14/A15
+       PG0=A10, PG1=A11, PG2=A12, PG3=A13, PG4=A14, PG5=A15 */
+    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
     HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 }
 
@@ -303,7 +317,7 @@ static void HAL_FSMC_MspDeInit(void)
     HAL_GPIO_DeInit(GPIOF, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 |
                             GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_12 |
                             GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);
-    HAL_GPIO_DeInit(GPIOG, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_10);
+    HAL_GPIO_DeInit(GPIOG, GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_10);
 }
 
 void HAL_SRAM_MspDeInit(SRAM_HandleTypeDef* hsram)

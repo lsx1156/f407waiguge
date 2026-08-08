@@ -25,6 +25,7 @@ typedef struct
 
 extern __lwip_dev g_lwipdev;
 extern struct netif g_lwip_netif;
+extern uint8_t g_lwip_inited;   /* 0=lwip初始化失败/未完成, 任务函数应跳过所有lwip调用 */
 
 void lwip_pkt_handle(void);
 void lwip_periodic_handle(uint32_t elapsed_ms);

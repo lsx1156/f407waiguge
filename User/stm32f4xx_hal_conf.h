@@ -210,7 +210,7 @@
 /* DP83848_PHY_ADDRESS Address*/
 #define DP83848_PHY_ADDRESS
 /* PHY Reset delay these values are based on a 1 ms Systick interrupt*/
-#define PHY_RESET_DELAY                 0x000000FFU
+#define PHY_RESET_DELAY                 ((uint32_t)0x00000FFF)
 /* PHY Configuration delay */
 #define PHY_CONFIG_DELAY                0x00000FFFU
 

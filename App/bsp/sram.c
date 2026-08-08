@@ -94,10 +94,14 @@ uint8_t sram_test(void)
 {
     uint32_t test_addr;
     uint16_t test_data;
-    uint32_t test_size = 64 * 1024;
+    /* v1.6: 只测试空闲区域 (0x6805C000 之后), 避免覆盖 MEM_TABLE/LWIP_HEAP/PBUF_POOL/FIFO/LOG/STATIC_BUF
+     * 之前: test_size = 64*1024, 从 0 开始 → 覆盖 MEM_TABLE 前64KB
+     * 现在: 从 MEM_STATIC_BUF 之后的空闲区开始, 测试 32KB 即可 */
+    uint32_t test_start = MEM_STATIC_BUF_ADDR + MEM_STATIC_BUF_SIZE - SRAM_BASE_ADDR;
+    uint32_t test_size  = 32 * 1024;
 
     test_data = 0x55AA;
-    for (test_addr = 0; test_addr < test_size; test_addr += 2)
+    for (test_addr = test_start; test_addr < test_start + test_size; test_addr += 2)
     {
         if (sram_test_write_read_16b(test_addr, test_data))
         {
@@ -106,13 +110,13 @@ uint8_t sram_test(void)
         test_data ^= 0xFFFF;
     }
 
-    for (test_addr = 0; test_addr < test_size; test_addr += 2)
+    for (test_addr = test_start; test_addr < test_start + test_size; test_addr += 2)
     {
         test_data = (uint16_t)(test_addr & 0xFFFF);
         *(volatile uint16_t *)(SRAM_BASE_ADDR + test_addr) = test_data;
     }
 
-    for (test_addr = 0; test_addr < test_size; test_addr += 2)
+    for (test_addr = test_start; test_addr < test_start + test_size; test_addr += 2)
     {
         test_data = (uint16_t)(test_addr & 0xFFFF);
         if (*(volatile uint16_t *)(SRAM_BASE_ADDR + test_addr) != test_data)

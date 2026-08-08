@@ -295,8 +295,10 @@ void USART1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+volatile uint32_t g_dbg_eth_irq_cnt = 0;
 void ETH_IRQHandler(void)
 {
+    g_dbg_eth_irq_cnt++;
     HAL_ETH_IRQHandler(&heth);
 }
 

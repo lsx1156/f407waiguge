@@ -34,6 +34,7 @@ typedef struct
 
 void sys_info_init(void);
 void sys_info_update(void);
+void sys_info_update_sram(void);
 sys_info_t *sys_info_get(void);
 void sys_info_idle_hook(void);
 void sys_info_work_start(void);

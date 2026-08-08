@@ -30,7 +30,7 @@
 ;   <o> Stack Size (in Bytes) <0x0-0xFFFFFFFF:8>
 ; </h>
 
-Stack_Size      EQU     0x00000400
+Stack_Size      EQU     0x00002000
 
                 AREA    STACK, NOINIT, READWRITE, ALIGN=3
 Stack_Mem       SPACE   Stack_Size
@@ -41,7 +41,7 @@ __initial_sp
 ;   <o>  Heap Size (in Bytes) <0x0-0xFFFFFFFF:8>
 ; </h>
 
-;δ�õ��������Դ����ڴ����(malloc,free��)������Heap_SzieΪ0
+;δ�õ��������Դ����ڴ����(malloc,free��)������Heap_SzieΪ0
 Heap_Size       EQU     0x00000000
 
                 AREA    HEAP, NOINIT, READWRITE, ALIGN=3
@@ -172,7 +172,19 @@ Reset_Handler    PROC
                  EXPORT  Reset_Handler             [WEAK]
         IMPORT  SystemInit
         IMPORT  __main
-                 LDR     R0, =0xE000ED88    ; ʹ�ܸ������� CP10,CP11
+                 ; ★ 清除粘滞故障位 (CFSR/HFSR/DFSR) ★
+                 ; 系统复位/看门狗/SWD复位均不清CFSR, 只有POR清
+                 LDR     R0, =0xE000ED28
+                 LDR     R1, =0xFFFFFFFF
+                 STR     R1, [R0]            ; CFSR
+                 LDR     R0, =0xE000ED2C
+                 STR     R1, [R0]            ; HFSR
+                 LDR     R0, =0xE000ED30
+                 MOV     R1, #0xF
+                 STR     R1, [R0]            ; DFSR
+                 DSB
+                 ISB
+                 LDR     R0, =0xE000ED88    ; ʹ�ܸ������� CP10,CP11
                  LDR     R1,[R0]
                  ORR     R1,R1,#(0xF << 20)
                  STR     R1,[R0]

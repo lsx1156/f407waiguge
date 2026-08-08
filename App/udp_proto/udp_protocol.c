@@ -1,5 +1,6 @@
 #include "udp_protocol.h"
 #include "lwip/sys.h"
+#include "safety.h"  /* g_safety_state.fault_code, g_comm_mode */
 
 typedef struct {
     volatile uint32_t head;
@@ -110,12 +111,33 @@ void report_frame_build(ReportFrame_t *frame, JointStatus_t *leg, JointStatus_t 
 
     frame->header.timestamp = HAL_GetTick();
 
+    /* v1.6.3: 统一故障码策略 (按总线分别应用 CANx_TIMEOUT)
+     *   - 每关节 fault_code 存系统级 g_safety_state.fault_code
+     *   - 腿部(CAN1 CyberGear): 只受 CAN1_TIMEOUT 影响, 屏蔽 CAN2_TIMEOUT
+     *   - 臂部(CAN2 RS01):     只受 CAN2_TIMEOUT 影响, 屏蔽 CAN1_TIMEOUT
+     *   - STANDALONE 模式下额外屏蔽 COMM_LOST, 与 safety / lcd_status 逻辑保持一致
+     * 原实现: leg[i].fault_code 存 CyberGear 电机内部故障寄存器/0 (RS01), 与上位机故障码字典不兼容,
+     *         导致 ESTOP/VOLTAGE_LOW/CANx_TIMEOUT 全误报, 且 CAN2 不接电机时腿部也显示 CAN2_TIMEOUT */
+    SAFETY_LOCK();
+    uint16_t sys_faults_all = (uint16_t)g_safety_state.fault_code;
+    /* 腿部 (CAN1): 仅应用 CAN1_TIMEOUT, 屏蔽 CAN2_TIMEOUT */
+    uint16_t leg_faults = sys_faults_all & ~(uint16_t)FAULT_CAN2_TIMEOUT;
+    /* 臂部 (CAN2): 仅应用 CAN2_TIMEOUT, 屏蔽 CAN1_TIMEOUT */
+    uint16_t arm_faults = sys_faults_all & ~(uint16_t)FAULT_CAN1_TIMEOUT;
+    if (g_comm_mode == COMM_MODE_STANDALONE) {
+        leg_faults &= ~(uint16_t)(FAULT_COMM_LOST | FAULT_CAN1_TIMEOUT | FAULT_CAN2_TIMEOUT);
+        arm_faults &= ~(uint16_t)(FAULT_COMM_LOST | FAULT_CAN1_TIMEOUT | FAULT_CAN2_TIMEOUT);
+    }
+    SAFETY_UNLOCK();
+
     for (int i = 0; i < 2; i++) {
         frame->leg_status[i] = leg[i];
+        frame->leg_status[i].fault_code = leg_faults;
     }
 
     for (int i = 0; i < 4; i++) {
         frame->arm_status[i] = arm[i];
+        frame->arm_status[i].fault_code = arm_faults;
     }
 
     frame->crc = crc16((uint8_t*)frame, sizeof(ReportFrame_t) - 2);
@@ -128,9 +150,16 @@ void command_frame_parse(CommandFrame_t *frame, JointCommand_t *commands)
     }
 }
 
+/* 调试计数器 (在主循环中打印) */
+volatile uint32_t g_dbg_isr_calls = 0;
+volatile uint32_t g_dbg_fifo_write_ok = 0;
+volatile uint32_t g_dbg_fifo_write_fail = 0;
+
 uint8_t report_fifo_write(ReportFrame_t *frame)
 {
-    return fifo_write(&g_report_fifo, frame);
+    uint8_t ret = fifo_write(&g_report_fifo, frame);
+    if (ret) g_dbg_fifo_write_ok++; else g_dbg_fifo_write_fail++;
+    return ret;
 }
 
 uint8_t command_fifo_write(JointCommand_t *commands)
@@ -158,7 +187,16 @@ uint8_t fault_fifo_read(uint16_t *fault_code)
     return fifo_read(&g_fault_fifo, fault_code);
 }
 
-JointCommand_t g_active_command[6] = {0};
+/* v1.6.3+fix: 默认全力矩模式 (CTRL_MODE_TORQUE=1) 零力矩, 防止上电默认POSITION(0)kp=10闭环拉回0→手动转动过流Error
+ * 关节ID: 0x01左髋,0x02右髋,0x10~0x13臂1~臂4 */
+JointCommand_t g_active_command[6] = {
+    {0x01, 1, 0, 60000, 20000, 50000, 0, 0, 0, 1, 1024, 6553, 131},  /* 腿0: 左髋, TORQUE, 零力矩 */
+    {0x02, 1, 0, 60000, 20000, 50000, 0, 0, 0, 1, 1024, 6553, 131},  /* 腿1: 右髋, TORQUE, 零力矩 */
+    {0x10, 1, 0, 60000, 20000, 50000, 0, 0, 0, 1, 1024, 6553, 131},  /* 臂0: Arm-1 */
+    {0x11, 1, 0, 60000, 20000, 50000, 0, 0, 0, 1, 1024, 6553, 131},  /* 臂1: Arm-2 */
+    {0x12, 1, 0, 60000, 20000, 50000, 0, 0, 0, 1, 1024, 6553, 131},  /* 臂2: Arm-3 */
+    {0x13, 1, 0, 60000, 20000, 50000, 0, 0, 0, 1, 1024, 6553, 131},  /* 臂3: Arm-4 */
+};
 uint32_t g_report_seq_num = 0;
 
 static SafeCmd_t g_cmd_buf[2] = {0};
@@ -194,6 +232,7 @@ uint32_t safe_cmd_get_version(void)
 }
 
 volatile uint32_t g_last_comm_ts = 0;
+volatile CommMode_e g_comm_mode = COMM_MODE_HOST;  /* 默认上位机模式 */
 
 void comm_heartbeat_kick(void)
 {
@@ -202,6 +241,9 @@ void comm_heartbeat_kick(void)
 
 uint8_t comm_is_heartbeat_ok(void)
 {
+    /* STANDALONE 模式下: 心跳超时不判故障，直接返回"真" */
+    if (g_comm_mode == COMM_MODE_STANDALONE) return 1;
+
     if (g_last_comm_ts == 0) return 0;
     return (HAL_GetTick() - g_last_comm_ts) < COMM_HEARTBEAT_TIMEOUT_MS;
 }

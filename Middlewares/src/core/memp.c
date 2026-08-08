@@ -445,3 +445,41 @@ memp_free(memp_t type, void *mem)
   }
 #endif
 }
+
+/**
+ * @ingroup mempool
+ * Sanitize (zero out) the UDP PCB pool's recv/recv_arg callbacks.
+ * 
+ * This is critical for STM32 targets using IWDG soft-reset:
+ * - IWDG soft-reset does NOT zero internal RAM .bss
+ * - The static UDP PCB pool retains stale values from the previous boot
+ * - Stale recv pointers (e.g. 0x6806C666, an external SRAM address)
+ *   cause HardFault when udp_input() invokes the callback
+ * 
+ * Call this BEFORE lwip_init() / memp_init() to ensure clean pool state.
+ */
+void
+memp_udp_pcb_pool_sanitize(void)
+{
+#if !MEMP_MEM_MALLOC
+  const struct memp_desc *desc;
+  struct udp_pcb *pcb;
+  u16_t i;
+
+  desc = memp_pools[MEMP_UDP_PCB];
+  if (desc == NULL || desc->base == NULL) {
+    return;
+  }
+
+  /* MEMP_SIZE = 0 when MEMP_OVERFLOW_CHECK is disabled (default),
+   * so pool elements are directly laid out as struct udp_pcb[]. */
+  pcb = (struct udp_pcb *)LWIP_MEM_ALIGN(desc->base);
+
+  for (i = 0; i < desc->num; ++i) {
+    pcb[i].recv     = NULL;
+    pcb[i].recv_arg = NULL;
+    /* also clear the linked-list pointer to be safe */
+    pcb[i].next     = NULL;
+  }
+#endif /* !MEMP_MEM_MALLOC */
+}

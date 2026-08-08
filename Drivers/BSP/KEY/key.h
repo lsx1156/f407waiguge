@@ -4,16 +4,16 @@
  * @author      MZXQ
  * @version     V1.0
  * @date        2021-10-14
- * @brief       °´¼üÊäÈë Çı¶¯´úÂë
+ * @brief       ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
  * @license     Copyright (c) 2020-2032, MZXQ
  ****************************************************************************************************
  * @attention
  *
- * ÊµÑéÆ½Ì¨:MZXQ F407¿ª·¢°å
+ * Êµï¿½ï¿½Æ½Ì¨:MZXQ F407ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
  *
- * ĞŞ¸ÄËµÃ÷
+ * ï¿½Ş¸ï¿½Ëµï¿½ï¿½
  * V1.0 20211014
- * µÚÒ»´Î·¢²¼
+ * ï¿½ï¿½Ò»ï¿½Î·ï¿½ï¿½ï¿½
  *
  ****************************************************************************************************
  */
@@ -25,28 +25,33 @@
 
 
 /******************************************************************************************/
-/* Òı½Å ¶¨Òå */
+/* ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ */
 
 #define KEY0_GPIO_PORT                  GPIOE
 #define KEY0_GPIO_PIN                   GPIO_PIN_4
-#define KEY0_GPIO_CLK_ENABLE()          do{ __HAL_RCC_GPIOE_CLK_ENABLE(); }while(0)   /* PE¿ÚÊ±ÖÓÊ¹ÄÜ */
+#define KEY0_GPIO_CLK_ENABLE()          do{ __HAL_RCC_GPIOE_CLK_ENABLE(); }while(0)   /* PEï¿½ï¿½Ê±ï¿½ï¿½Ê¹ï¿½ï¿½ */
 
 #define WKUP_GPIO_PORT                  GPIOA
 #define WKUP_GPIO_PIN                   GPIO_PIN_0
-#define WKUP_GPIO_CLK_ENABLE()          do{ __HAL_RCC_GPIOA_CLK_ENABLE(); }while(0)   /* PA¿ÚÊ±ÖÓÊ¹ÄÜ */
+#define WKUP_GPIO_CLK_ENABLE()          do{ __HAL_RCC_GPIOA_CLK_ENABLE(); }while(0)   /* PAï¿½ï¿½Ê±ï¿½ï¿½Ê¹ï¿½ï¿½ */
 
 /******************************************************************************************/
 
-#define KEY0        HAL_GPIO_ReadPin(KEY0_GPIO_PORT, KEY0_GPIO_PIN)     /* ¶ÁÈ¡KEY0Òı½Å */
-#define WK_UP       HAL_GPIO_ReadPin(WKUP_GPIO_PORT, WKUP_GPIO_PIN)     /* ¶ÁÈ¡WKUPÒı½Å */
+#define KEY0        HAL_GPIO_ReadPin(KEY0_GPIO_PORT, KEY0_GPIO_PIN)     /* ï¿½ï¿½È¡KEY0ï¿½ï¿½ï¿½ï¿½ */
+#define WK_UP       HAL_GPIO_ReadPin(WKUP_GPIO_PORT, WKUP_GPIO_PIN)     /* ï¿½ï¿½È¡WKUPï¿½ï¿½ï¿½ï¿½ */
 
 
-#define KEY0_PRES    1              /* KEY0°´ÏÂ */
-#define WKUP_PRES    4              /* KEY_UP°´ÏÂ(¼´WK_UP) */
+#define KEY0_PRES        1   /* KEY0 short press */
+#define WKUP_PRES        4   /* WKUP short press */
+#define KEY0_LONG_PRES   2   /* KEY0 long press (>800ms) */
+#define WKUP_LONG_PRES   8   /* WKUP long press (>2000ms, é˜²è¯¯è§¦) */
 
-void key_init(void);                /* °´¼ü³õÊ¼»¯º¯Êı */
-uint8_t key_scan(void);     /* °´¼üÉ¨Ãèº¯Êı */
-//uint8_t key_scan(uint8_t mode);     /* °´¼üÉ¨Ãèº¯Êı */
+#define KEY_LONG_PRESS_MS   3000   /* KEY0 é•¿æŒ‰é˜ˆå€¼ (E-STOP, è®¾é•¿é˜²è¯¯è§¦) */
+#define WKUP_LONG_PRESS_MS  5000   /* WKUP é•¿æŒ‰é˜ˆå€¼ (æ¨¡å¼åˆ‡æ¢, è®¾é•¿é˜²è¯¯è§¦) */
+
+void key_init(void);
+uint8_t key_scan(void);
+//uint8_t key_scan(uint8_t mode);     /* ï¿½ï¿½ï¿½ï¿½É¨ï¿½èº¯ï¿½ï¿½ */
 #endif
 
 

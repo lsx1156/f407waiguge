@@ -4,16 +4,16 @@
  * @author      MZXQ
  * @version     V1.0
  * @date        2021-10-14
- * @brief       °´¼üÊäÈë Çý¶¯´úÂë
+ * @brief       ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
  * @license     Copyright (c) 2020-2032, MZXQ
  ****************************************************************************************************
  * @attention
  *
- * ÊµÑéÆ½Ì¨:MZXQ F407¿ª·¢°å
+ * Êµï¿½ï¿½Æ½Ì¨:MZXQ F407ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
  *
- * ÐÞ¸ÄËµÃ÷
+ * ï¿½Þ¸ï¿½Ëµï¿½ï¿½
  * V1.0 20211014
- * µÚÒ»´Î·¢²¼
+ * ï¿½ï¿½Ò»ï¿½Î·ï¿½ï¿½ï¿½
  *
  ****************************************************************************************************
  */
@@ -23,53 +23,117 @@
 
 
 /**
- * @brief       °´¼ü³õÊ¼»¯º¯Êý
- * @param       ÎÞ
- * @retval      ÎÞ
+ * @brief       ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+ * @param       ï¿½ï¿½
+ * @retval      ï¿½ï¿½
  */
 void key_init(void)
 {
-    GPIO_InitTypeDef gpio_init_struct;                          /* GPIOÅäÖÃ²ÎÊý´æ´¢±äÁ¿ */
-    KEY0_GPIO_CLK_ENABLE();                                     /* KEY0Ê±ÖÓÊ¹ÄÜ */
-    WKUP_GPIO_CLK_ENABLE();                                     /* WKUPÊ±ÖÓÊ¹ÄÜ */
+    GPIO_InitTypeDef gpio_init_struct;                          /* GPIOï¿½ï¿½ï¿½Ã²ï¿½ï¿½ï¿½ï¿½æ´¢ï¿½ï¿½ï¿½ï¿½ */
+    KEY0_GPIO_CLK_ENABLE();                                     /* KEY0Ê±ï¿½ï¿½Ê¹ï¿½ï¿½ */
+    WKUP_GPIO_CLK_ENABLE();                                     /* WKUPÊ±ï¿½ï¿½Ê¹ï¿½ï¿½ */
 
-    gpio_init_struct.Pin = KEY0_GPIO_PIN;                       /* KEY0Òý½Å */
-    gpio_init_struct.Mode = GPIO_MODE_INPUT;                    /* ÊäÈë */
-    gpio_init_struct.Pull = GPIO_PULLUP;                        /* ÉÏÀ­ */
-    gpio_init_struct.Speed = GPIO_SPEED_FREQ_HIGH;              /* ¸ßËÙ */
-    HAL_GPIO_Init(KEY0_GPIO_PORT, &gpio_init_struct);           /* KEY0Òý½ÅÄ£Ê½ÉèÖÃ,ÉÏÀ­ÊäÈë */
+    gpio_init_struct.Pin = KEY0_GPIO_PIN;                       /* KEY0ï¿½ï¿½ï¿½ï¿½ */
+    gpio_init_struct.Mode = GPIO_MODE_INPUT;                    /* ï¿½ï¿½ï¿½ï¿½ */
+    gpio_init_struct.Pull = GPIO_PULLUP;                        /* ï¿½ï¿½ï¿½ï¿½ */
+    gpio_init_struct.Speed = GPIO_SPEED_FREQ_HIGH;              /* ï¿½ï¿½ï¿½ï¿½ */
+    HAL_GPIO_Init(KEY0_GPIO_PORT, &gpio_init_struct);           /* KEY0ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½,ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 
-    gpio_init_struct.Pin = WKUP_GPIO_PIN;                       /* WKUPÒý½Å */
-    gpio_init_struct.Mode = GPIO_MODE_INPUT;                    /* ÊäÈë */
-    gpio_init_struct.Pull = GPIO_PULLDOWN;                      /* ÏÂÀ­ */
-    gpio_init_struct.Speed = GPIO_SPEED_FREQ_HIGH;              /* ¸ßËÙ */
-    HAL_GPIO_Init(WKUP_GPIO_PORT, &gpio_init_struct);           /* WKUPÒý½ÅÄ£Ê½ÉèÖÃ,ÏÂÀ­ÊäÈë */
+    gpio_init_struct.Pin = WKUP_GPIO_PIN;                       /* WKUPï¿½ï¿½ï¿½ï¿½ */
+    gpio_init_struct.Mode = GPIO_MODE_INPUT;                    /* ï¿½ï¿½ï¿½ï¿½ */
+    gpio_init_struct.Pull = GPIO_PULLDOWN;                      /* ï¿½ï¿½ï¿½ï¿½ */
+    gpio_init_struct.Speed = GPIO_SPEED_FREQ_HIGH;              /* ï¿½ï¿½ï¿½ï¿½ */
+    HAL_GPIO_Init(WKUP_GPIO_PORT, &gpio_init_struct);           /* WKUPï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½,ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ */
 
 }
 
 /**
- * @brief       °´¼üÉ¨Ãèº¯Êý
- * @retval      ¼üÖµ, ¶¨ÒåÈçÏÂ:
- *              KEY0_PRES, 1, KEY0°´ÏÂ
- *              WKUP_PRES, 4, WKUP°´ÏÂ
+ * @brief       Key scan function with long-press support (non-blocking)
+ * @retval      Key event code:
+ *              KEY0_PRES (1)      - KEY0 short press
+ *              KEY0_LONG_PRES (2) - KEY0 long press (>800ms)
+ *              WKUP_PRES (4)      - WKUP short press
+ *              WKUP_LONG_PRES (8) - WKUP long press (>800ms)
+ *              0                   - No key event
  */
-uint8_t key_scan()
+uint8_t key_scan(void)
 {
-		if (KEY0 == 1){
-			delay_ms(10);
-				if (KEY0 == 1){
-					while(KEY0 == 1);
-					return KEY0_PRES;
-				}
-		}
-		if (WK_UP == 1){
-			delay_ms(10);
-				if (WK_UP == 1){
-					while(WK_UP == 1);
-					return WKUP_PRES;
-				}
-		}
-    return 0;              /* ·µ»Ø¼üÖµ */
+    static uint8_t key0_state = 0;      /* 0=idle, 1=debounce, 2=pressed, 3=long fired */
+    static uint32_t key0_press_ts = 0;
+    static uint8_t wkup_state = 0;
+    static uint32_t wkup_press_ts = 0;
+    uint8_t result = 0;
+    uint32_t now = HAL_GetTick();
+
+#define KEY_DEBOUNCE_MS  20   /* æ¶ˆæŠ–æ—¶é—´, éžé˜»å¡ž */
+
+    /* ---- KEY0 ---- */
+    /* KEY0 (PE4) ä¸Šæ‹‰è¾“å…¥: æœªæŒ‰ä¸‹=1(é«˜), æŒ‰ä¸‹=0(ä½Ž) */
+    if (key0_state == 0) {
+        if (KEY0 == 0) {
+            key0_state = 1;          /* è¿›å…¥æ¶ˆæŠ– */
+            key0_press_ts = now;
+        }
+    } else if (key0_state == 1) {
+        if (now - key0_press_ts >= KEY_DEBOUNCE_MS) {
+            if (KEY0 == 0) {
+                key0_state = 2;      /* ç¡®è®¤æŒ‰ä¸‹ */
+                key0_press_ts = now; /* é‡æ–°è®¡æ—¶ç”¨äºŽé•¿æŒ‰æ£€æµ‹ */
+            } else {
+                key0_state = 0;      /* æŠ–åŠ¨, å¤ä½ */
+            }
+        }
+    } else if (key0_state == 2) {
+        if (KEY0 == 1) {
+            /* Released - short press */
+            key0_state = 0;
+            result = KEY0_PRES;
+        } else if (now - key0_press_ts >= KEY_LONG_PRESS_MS) {
+            /* Long press detected */
+            key0_state = 3;
+            result = KEY0_LONG_PRES;
+        }
+    } else if (key0_state == 3) {
+        if (KEY0 == 1) {
+            key0_state = 0;
+        }
+    }
+
+    /* If KEY0 already produced a result, skip WKUP this cycle */
+    if (result != 0) return result;
+
+    /* ---- WKUP ---- */
+    if (wkup_state == 0) {
+        if (WK_UP == 1) {
+            wkup_state = 1;          /* è¿›å…¥æ¶ˆæŠ– */
+            wkup_press_ts = now;
+        }
+    } else if (wkup_state == 1) {
+        if (now - wkup_press_ts >= KEY_DEBOUNCE_MS) {
+            if (WK_UP == 1) {
+                wkup_state = 2;      /* ç¡®è®¤æŒ‰ä¸‹ */
+                wkup_press_ts = now; /* é‡æ–°è®¡æ—¶ç”¨äºŽé•¿æŒ‰æ£€æµ‹ */
+            } else {
+                wkup_state = 0;      /* æŠ–åŠ¨, å¤ä½ */
+            }
+        }
+    } else if (wkup_state == 2) {
+        if (WK_UP == 0) {
+            /* Released - short press */
+            wkup_state = 0;
+            result = WKUP_PRES;
+        } else if (now - wkup_press_ts >= WKUP_LONG_PRESS_MS) {
+            /* Long press detected */
+            wkup_state = 3;
+            result = WKUP_LONG_PRES;
+        }
+    } else if (wkup_state == 3) {
+        if (WK_UP == 0) {
+            wkup_state = 0;
+        }
+    }
+
+    return result;
 }
 
 

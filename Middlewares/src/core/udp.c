@@ -86,6 +86,10 @@ struct udp_pcb *udp_pcbs;
 void
 udp_init(void)
 {
+  /* 关键修复: 软复位 (IWDG) 不清内部 RAM .bss,
+   * udp_pcbs 链表头会保留上次崩溃的脏指针, 导致
+   * udp_input() 遍历链表时 BusFault. 必须显式清零. */
+  udp_pcbs = NULL;
 #ifdef LWIP_RAND
   udp_port = UDP_ENSURE_LOCAL_PORT_RANGE(LWIP_RAND());
 #endif /* LWIP_RAND */
@@ -108,6 +112,10 @@ again:
   }
   /* Check all PCBs. */
   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
+    /* 安全检查: 防止软复位残留脏指针导致 BusFault */
+    if ((uint32_t)pcb < 0x20000000 || (uint32_t)pcb >= 0x20030000) {
+      break;
+    }
     if (pcb->local_port == udp_port) {
       if (++n > (UDP_LOCAL_PORT_RANGE_END - UDP_LOCAL_PORT_RANGE_START)) {
         return 0;
@@ -207,6 +215,20 @@ udp_input(struct pbuf *p, struct netif *inp)
   LWIP_ASSERT("udp_input: invalid pbuf", p != NULL);
   LWIP_ASSERT("udp_input: invalid netif", inp != NULL);
 
+  /* ★★★ 最后一道防线: 检查 udp_pcbs 链表头合法性 ★★★
+   * 软复位 (IWDG) 不清内部 RAM, udp_pcbs 可能保留脏指针.
+   * 如果链表头不在内部 RAM 范围内 (0x20000000 ~ 0x20030000),
+   * 或者链表头本身就是已知脏值 (0x6806C666 / 0x6805C000),
+   * 强制清零链表头, 防止遍历链表时 BusFault. */
+  if (udp_pcbs != NULL) {
+    if ((uint32_t)udp_pcbs < 0x20000000 || (uint32_t)udp_pcbs >= 0x20030000 ||
+        (uint32_t)udp_pcbs == 0x6806C666 || (uint32_t)udp_pcbs == 0x6805C000) {
+      LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
+        ("udp_input: udp_pcbs=%p (CORRUPTED!), resetting to NULL\r\n", udp_pcbs));
+      udp_pcbs = NULL;
+    }
+  }
+
   PERF_START;
 
   UDP_STATS_INC(udp.recv);
@@ -251,6 +273,22 @@ udp_input(struct pbuf *p, struct netif *inp)
    * preferred. If no perfect match is found, the first unconnected pcb that
    * matches the local port and ip address gets the datagram. */
   for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
+    /* 安全检查: pcb 必须在内部 RAM 范围内 (0x20000000 ~ 0x20030000),
+     * 防止软复位残留脏指针导致遍历链表时 BusFault */
+    if ((uint32_t)pcb < 0x20000000 || (uint32_t)pcb >= 0x20030000) {
+      LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
+        ("udp_input: pcb=%p (not in RAM!), abort list walk\r\n", pcb));
+      break;
+    }
+    /* ★★★ 额外保险: 如果 pcb->recv 不在 Flash 范围内, 直接清零,
+     * 防止后续调用时 HardFault. 0x6806C666 就是典型的漏网脏值. */
+    if (pcb->recv != NULL &&
+        ((uint32_t)pcb->recv < 0x08000000 || (uint32_t)pcb->recv >= 0x08200000)) {
+      LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
+        ("udp_input: pcb=%p recv=%p (CORRUPTED!), clearing\r\n", pcb, pcb->recv));
+      pcb->recv = NULL;
+      pcb->recv_arg = NULL;
+    }
     /* print the PCB local and remote address */
     LWIP_DEBUGF(UDP_DEBUG, ("pcb ("));
     ip_addr_debug_print_val(UDP_DEBUG, pcb->local_ip);
@@ -381,6 +419,10 @@ udp_input(struct pbuf *p, struct netif *inp)
            if SOF_REUSEADDR is set on the first match */
         struct udp_pcb *mpcb;
         for (mpcb = udp_pcbs; mpcb != NULL; mpcb = mpcb->next) {
+          /* 安全检查: mpcb 必须在内部 RAM 范围内 */
+          if ((uint32_t)mpcb < 0x20000000 || (uint32_t)mpcb >= 0x20030000) {
+            break;
+          }
           if (mpcb != pcb) {
             /* compare PCB local addr+port to UDP destination addr+port */
             if ((mpcb->local_port == dest) &&
@@ -388,6 +430,14 @@ udp_input(struct pbuf *p, struct netif *inp)
               /* pass a copy of the packet to all local matches */
               if (mpcb->recv != NULL) {
                 struct pbuf *q;
+                /* 安全检查: recv 回调必须指向 Flash 范围 (0x08000000 ~ 0x08200000),
+                 * 防止软复位残留脏指针 (如 0x6806C666 外部SRAM) 导致 HardFault.
+                 * 之前只检查了 < 0x08000000, 但 0x6806C666 > 0x08000000, 漏掉了! */
+                if ((uint32_t)mpcb->recv < 0x08000000 || (uint32_t)mpcb->recv >= 0x08200000) {
+                  LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
+                    ("udp_input: mpcb->recv=%p (not in Flash!), skipping\r\n", mpcb->recv));
+                  continue;
+                }
                 q = pbuf_clone(PBUF_RAW, PBUF_POOL, p);
                 if (q != NULL) {
                   mpcb->recv(mpcb->recv_arg, mpcb, q, ip_current_src_addr(), src);
@@ -400,6 +450,15 @@ udp_input(struct pbuf *p, struct netif *inp)
 #endif /* SO_REUSE && SO_REUSE_RXTOALL */
       /* callback */
       if (pcb->recv != NULL) {
+        /* 安全检查: recv 回调必须指向 Flash 范围 (0x08000000 ~ 0x08200000),
+         * 防止软复位残留脏指针 (如 0x6806C666 外部SRAM) 导致 HardFault.
+         * 之前只检查了 < 0x08000000, 但 0x6806C666 > 0x08000000, 漏掉了! */
+        if ((uint32_t)pcb->recv < 0x08000000 || (uint32_t)pcb->recv >= 0x08200000) {
+          LWIP_DEBUGF(UDP_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
+            ("udp_input: pcb->recv=%p (not in Flash!), freeing pbuf\r\n", pcb->recv));
+          pbuf_free(p);
+          goto end;
+        }
         /* now the recv function is responsible for freeing p */
         pcb->recv(pcb->recv_arg, pcb, p, ip_current_src_addr(), src);
       } else {

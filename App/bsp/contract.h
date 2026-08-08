@@ -65,6 +65,42 @@ typedef uint16_t Temp_deciC_t;
 #define PARAM_CMD_UPDATEPID     0x02
 #define PARAM_CMD_UPDATEFAULT   0x03
 #define PARAM_CMD_SWITCHTABLE   0x04
+#define PARAM_CMD_WRITE_ABO     0x10   /* 写 ABO 观测器参数 (RK3506 下发) */
+
+/* ========== ABO Observer Defaults (Q 定点) ========== */
+#define ABO_DEFAULT_GAIN_Q10    1024   /* G = 1.0 (0 助力起步, 人感觉不到电机存在) */
+#define ABO_DEFAULT_ALPHA_Q16   655    /* α ≈ 0.01, HPF 截止 ~ 1.6 Hz (1ms 采样) */
+#define ABO_DEFAULT_LEAK_Q16    66     /* 偏置泄漏 ≈ 0.001, 时间常数 ~1s */
+
+/* ========== Communication Mode ========== */
+typedef enum {
+    COMM_MODE_HOST       = 0,   /* 上位机控制模式 (默认, 心跳超时→故障) */
+    COMM_MODE_STANDALONE = 1    /* 离线自主模式 (心跳超时忽略, 本地步态/按键控制) */
+} CommMode_e;
+
+extern volatile CommMode_e g_comm_mode;
+
+/* ========== ABO Observer State (per-joint) ========== */
+/* ========== ABO → ESO3 迁移路径说明 (P2-6) ==========
+ * legacy: g_abo_state[] 在 1kHz ISR 持续更新 (abo_update_one), 各关节独立 bias/HPF.
+ * v1.8+:  JointUnitState.eso_enable=1 后启用 §B ESO3 路径, 此时 g_abo_state 仅作
+ *         "只读回退"——上层(ABO参数下发/LCD显示/EEPROM持久化)仍可读 g_abo_state,
+ *         但其 bias_est/assist 不再驱动电机 (力矩由 ESO3+导纳 tau_cmd 接管).
+ *         迁移期间 legacy 字段保持兼容, 不删除以避免破坏 EEPROM 布局与上位机协议. */
+typedef struct PACKED {
+    int32_t  bias_est;         /* 重力偏置估计 (mNm), 持久化存 EEPROM */
+    int32_t  hpf_state;        /* HPF 内部状态 (mNm) */
+    uint16_t assist_gain_q10;  /* 助力增益 G * 1024 (RK 下发) */
+    uint16_t hpf_alpha_q16;    /* HPF 系数 α * 65536 (RK 下发) */
+    uint16_t bias_leak_q16;    /* 偏置泄漏系数 * 65536 (RK 下发) */
+    uint8_t  enable;           /* 该关节是否启用 ABO (0=关, 1=开) */
+    uint8_t  industrial_mode;  /* ★ v1.7: 1=工业模式, 0=医疗模式 */
+    /* ★ v1.7: 工业模式专用字段 */
+    int32_t  load_est_q10;     /* 估计外部负载力矩 (mNm, Q10) */
+    uint16_t load_freeze_cnt;  /* 负载突变冻结偏置计数器 (ms) */
+    int32_t  bp_lpf_state;     /* 带通低通部分状态 (mNm) */
+    int32_t  tau_prev;         /* 上周期力矩 (用于突变检测) */
+} ABOState_t;
 
 /* ========== Frame Header (8 bytes) ========== */
 typedef struct PACKED {
@@ -92,7 +128,7 @@ typedef struct PACKED {
     uint16_t crc;
 } ReportFrame_t;
 
-/* ========== Single Joint Command (16 bytes packed) ========== */
+/* ========== Single Joint Command (22 bytes packed, v1.1 with ABO) ========== */
 typedef struct PACKED {
     uint8_t joint_id;
     uint8_t control_mode;
@@ -103,7 +139,10 @@ typedef struct PACKED {
     uint8_t pid_set_index;
     uint8_t kp;
     uint8_t kd;
-    uint8_t reserved;
+    uint8_t abo_enable;         /* ABO 使能 (该关节是否启用观测器) */
+    uint16_t assist_gain_q10;   /* 助力增益 G * 1024 */
+    uint16_t hpf_alpha_q16;     /* HPF 系数 α * 65536 */
+    uint16_t bias_leak_q16;     /* 偏置泄漏系数 * 65536 */
 } JointCommand_t;
 
 /* ========== Command Frame ========== */
@@ -142,12 +181,12 @@ typedef struct PACKED {
 /* ========== Frame Size Constants (match packed sizeof) ========== */
 #define FRAME_HEADER_SIZE       8
 #define JOINT_STATUS_SIZE       17
-#define JOINT_COMMAND_SIZE      16
+#define JOINT_COMMAND_SIZE      22    /* v1.1: +ABO params, 16→22 */
 #define PID_PARAMS_SIZE         16
 #define CRC_SIZE                2
 
 #define REPORT_FRAME_SIZE       (FRAME_HEADER_SIZE + 6*JOINT_STATUS_SIZE + CRC_SIZE)
-#define COMMAND_FRAME_SIZE      (8 + 6*16 + 2)
+#define COMMAND_FRAME_SIZE      (8 + 6*22 + 2)   /* v1.1: 6 joints × 22 bytes */
 #define HEARTBEAT_FRAME_SIZE    (8 + 2 + 2)
 
 

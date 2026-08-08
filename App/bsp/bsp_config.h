@@ -3,6 +3,12 @@
 
 #include "stm32f4xx.h"
 
+/* ========== Compile-Time Mode Switch (v1.7) ==========
+ * INDUSTRIAL_MODE = 1 : 工业外骨骼 (负载搬运, ABO 极慢泄漏 + 带通 + 增益调度)
+ * INDUSTRIAL_MODE = 0 : 医疗/康复 (步态相位, ABO 分相切换)
+ * WKUP 短按循环: ZERO → GAIT → [INDUSTRIAL if 1] → ZERO */
+#define INDUSTRIAL_MODE     1
+
 /* ========== Pin Definitions ========== */
 
 /* CAN1 */
@@ -18,7 +24,8 @@
 #define CAN2_TX_PORT        GPIOB
 
 /* Enable Pins (Push-Pull, Active High, Default Low)
- * EN_ARM_1/2 moved from PE0/PE1 to PE4/PE5 to avoid FSMC_NBL0/NBL1 conflict
+ * v1.6.7: EN_ARM_1 moved from PE4 to PE6 to avoid conflict with KEY0 (PE4)
+ * EN_ARM_2/3/4 remain on PE5/PE2/PE3
  * EN_LEG_L/R moved from PD12/PD13 to PC6/PC7 to avoid FSMC_A17/A18 conflict
  * 硬件逻辑: 拉低 = 切断电机驱动板动力级使能（硬件急停回路） */
 #define EN_LEG_L_PIN        GPIO_PIN_6
@@ -26,7 +33,7 @@
 #define EN_LEG_R_PIN        GPIO_PIN_7
 #define EN_LEG_R_PORT       GPIOC
 
-#define EN_ARM_1_PIN        GPIO_PIN_4
+#define EN_ARM_1_PIN        GPIO_PIN_6
 #define EN_ARM_1_PORT       GPIOE
 #define EN_ARM_2_PIN        GPIO_PIN_5
 #define EN_ARM_2_PORT       GPIOE
@@ -143,9 +150,15 @@
 #define MOTOR_ID_ARM_3      0x12
 #define MOTOR_ID_ARM_4      0x13
 
+#ifndef MOTOR_LEG_0_ID
 #define MOTOR_LEG_0_ID      MOTOR_ID_LEG_LHIP
+#endif
+#ifndef MOTOR_LEG_1_ID
 #define MOTOR_LEG_1_ID      MOTOR_ID_LEG_LKNEE
+#endif
+#ifndef MOTOR_ARM_0_ID
 #define MOTOR_ARM_0_ID      MOTOR_ID_ARM_1
+#endif
 
 /* ========== Communication Configuration ========== */
 
@@ -155,7 +168,18 @@
 /* ========== Control Period ========== */
 
 #define CONTROL_PERIOD_LEG  1   /* ms */
-#define CONTROL_PERIOD_ARM  2   /* ms */
+#define CONTROL_PERIOD_ARM  1   /* ms, 与接收周期一致, 避免观测器/控制器采样频率混叠 */
+
+/* v1.8.1 P1-1b: §C/§D/§E 全局任务降频目标 (Hz). control_task_run 默认 100Hz,
+ * 用静态分频计数器把 §C/§D/§E 三调用降到本频率 (节省 CPU). safety 保持 100Hz.
+ * 取值须能整除 100 (如 50/25/20). 100/本值 = 分频系数. */
+#ifndef GLOBAL_TASK_RATE_HZ
+#define GLOBAL_TASK_RATE_HZ 50
+#endif
+
+/* 髋关节步态目标钳位范围 (mdeg) — 亦作 JointUnit 腿部软限位 */
+#define LOCAL_HIP_POS_MAX_MDEG    90000
+#define LOCAL_HIP_POS_MIN_MDEG   -30000
 
 /* ========== Interpolation Table Size ========== */
 
@@ -163,7 +187,34 @@
 #define FRICTION_TABLE_SIZE 128
 #define PID_PARAM_SET_COUNT 16
 
-/* ========== Memory Partition Configuration ========== */
+/* LZ4 表格压缩开关: 0=关闭(当前表小, 直接原始数组), 1=启用(表>4KB时打开, 需配合 tools/gen_lz4_tables.py 生成的头文件 */
+#ifndef LZ4_TABLES_USE_COMPRESSION
+#define LZ4_TABLES_USE_COMPRESSION  0
+#endif
+
+/* ========== Memory Partition Configuration ==========
+ *
+ *  External SRAM (IS62WV51216BLL, 1MB @ 0x68000000) Layout:
+ *
+ *  0x6800_0000 ┌─────────────────────────────┐
+ *              │  TABLE Area (128 KB)         │  阻尼/摩擦/步态表, 未来可扩展
+ *              │  - 0x6800_0000 Damping      │
+ *              │  - 0x6801_0000 Friction     │
+ *              │  - 0x6802_0000 (reserved)   │
+ *  0x6802_0000 ├─────────────────────────────┤
+ *              │  LwIP Heap (64 KB)           │  MEM_LWIP_HEAP_SIZE
+ *  0x6803_0000 ├─────────────────────────────┤
+ *              │  PBUF Pool (32 KB)            │  MEM_PBUF_POOL_SIZE
+ *  0x6803_8000 ├─────────────────────────────┤
+ *              │  FIFO Ext (64 KB)             │  CAN/UDP 乒乓缓冲
+ *  0x6804_8000 ├─────────────────────────────┤
+ *              │  Log Buffer (64 KB)           │  运行日志环形缓冲
+ *  0x6805_8000 ├─────────────────────────────┤
+ *              │  Static Buffer (16 KB)        │  DMA/临时工作区
+ *  0x6805_C000 ├─────────────────────────────┤
+ *              │  (Free, ~656 KB)              │  未来扩展: 大表/OTA/帧存
+ *  0x680F_FFFF └─────────────────────────────┘
+ */
 
 #define MEM_SRAM_START       0x20000000
 #define MEM_SRAM_SIZE        (192 * 1024)   /* F407ZG 内部 RAM 192KB */
@@ -172,18 +223,31 @@
 #define MEM_EXT_SRAM_START   SRAM_BASE_ADDR
 #define MEM_EXT_SRAM_SIZE    SRAM_SIZE
 
-#define MEM_LWIP_HEAP_SIZE     (64 * 1024)
-#define MEM_PBUF_POOL_SIZE     (32 * 1024)
-#define MEM_FIFO_EXT_SIZE      (64 * 1024)
-#define MEM_LOG_SIZE           (64 * 1024)
-#define MEM_TABLES_SIZE        (8 * 1024)
-#define MEM_RESERVED_SIZE      (832 * 1024)
+/* --- External SRAM partitions (address + size) --- */
+#define MEM_TABLE_ADDR        (MEM_EXT_SRAM_START + 0x00000000)   /* 0x6800_0000 */
+#define MEM_TABLE_SIZE        (128 * 1024)
 
-#define MEM_STATIC_BUFFER_SIZE (16 * 1024)
+#define MEM_LWIP_HEAP_ADDR    (MEM_TABLE_ADDR + MEM_TABLE_SIZE)       /* 0x6802_0000 */
+#define MEM_LWIP_HEAP_SIZE    (64 * 1024)
+
+#define MEM_PBUF_POOL_ADDR    (MEM_LWIP_HEAP_ADDR + MEM_LWIP_HEAP_SIZE)  /* 0x6803_0000 */
+#define MEM_PBUF_POOL_SIZE    (32 * 1024)
+
+#define MEM_FIFO_EXT_ADDR     (MEM_PBUF_POOL_ADDR + MEM_PBUF_POOL_SIZE)   /* 0x6803_8000 */
+#define MEM_FIFO_EXT_SIZE     (64 * 1024)
+
+#define MEM_LOG_ADDR          (MEM_FIFO_EXT_ADDR + MEM_FIFO_EXT_SIZE)     /* 0x6804_8000 */
+#define MEM_LOG_SIZE          (64 * 1024)
+
+#define MEM_STATIC_BUF_ADDR   (MEM_LOG_ADDR + MEM_LOG_SIZE)               /* 0x6805_8000 */
+#define MEM_STATIC_BUF_SIZE   (16 * 1024)
+
+/* Kept for backward compatibility */
+#define MEM_TABLES_SIZE        MEM_TABLE_SIZE
 
 /* ========== FIFO Configuration ========== */
 
-#define FIFO_REPORT_SIZE     8
+#define FIFO_REPORT_SIZE     32
 #define FIFO_COMMAND_SIZE    4
 #define FIFO_FAULT_SIZE      4
 

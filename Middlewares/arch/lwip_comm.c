@@ -18,6 +18,7 @@
 
 __lwip_dev g_lwipdev;
 struct netif g_lwip_netif;
+uint8_t g_lwip_inited = 0;   /* lwip 是否初始化成功，失败时任务函数跳过所有调用 */
 
 #if LWIP_DHCP
 uint32_t g_dhcp_fine_timer = 0;
@@ -60,7 +61,6 @@ void lwip_comm_default_ip_set(__lwip_dev *lwipx)
 
 uint8_t lwip_comm_init(void)
 {
-    uint8_t retry = 0;
     struct netif *netif_init_flag;
     ip_addr_t ipaddr;
     ip_addr_t netmask;
@@ -68,17 +68,25 @@ uint8_t lwip_comm_init(void)
 
     lwip_comm_default_ip_set(&g_lwipdev);
 
-    while (ethernet_init())
-    {
-        retry++;
-        if (retry > 5)
-        {
-            retry = 0;
-            return 3;
-        }
+    /* 只初始化 1 次, 失败立即返回, 由上层 main 循环 5 秒后重试
+     * 避免重试 6 次 × ~500ms = 3s 纯阻塞导致主循环卡死、喂狗超时 */
+    if (ethernet_init() != 0) {
+        g_lwip_inited = 0;
+        return 3;
     }
 
+    HAL_IWDG_Refresh(&hiwdg);  /* 喂狗, 防止 ETH 初始化时间过长 */
     lwip_init();
+
+    /* 关键: 软复位 (IWDG/SYSRESETREQ) 不清内部 RAM .bss,
+     * LWIP 全局链表头 udp_pcbs 仍指向上次崩溃的脏 PCB.
+     * 收到包时 udp_input() 会遍历链表匹配到旧 PCB 并调用
+     * 其 recv 回调 (垃圾指针 0x6806C666) 导致 HardFault.
+     * 必须在 lwip_init() 之后、任何 UDP 操作之前将链表头置空. */
+    {
+        extern struct udp_pcb *udp_pcbs;
+        udp_pcbs = NULL;
+    }
 
 #if LWIP_DHCP
     ip_addr_set_zero_ip4(&ipaddr);
@@ -120,11 +128,13 @@ uint8_t lwip_comm_init(void)
 #if LWIP_DHCP
     g_lwipdev.dhcpstatus = 0;
 #endif
+    g_lwip_inited = 1;   /* 初始化成功，任务函数可以调用 lwip API */
     return 0;
 }
 
 void lwip_pkt_handle(void)
 {
+    if (!g_lwip_inited) return;
     ethernetif_input(&g_lwip_netif);
     ethernetif_check_link_status(&g_lwip_netif);
     udp_net_poll();
@@ -148,6 +158,7 @@ void lwip_link_status_updated(struct netif *netif)
 
 void lwip_periodic_handle(uint32_t elapsed_ms)
 {
+    if (!g_lwip_inited) return;
     UNUSED(elapsed_ms);
     ethernetif_check_link_status(&g_lwip_netif);
     sys_check_timeouts();

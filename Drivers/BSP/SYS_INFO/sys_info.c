@@ -1,6 +1,7 @@
 #include "./BSP/SYS_INFO/sys_info.h"
 #include "./SYSTEM/delay/delay.h"
 #include "./SYSTEM/usart/usart.h"
+#include "bsp_config.h"
 #include <stdio.h>
 
 extern uint32_t Image$$ER_IROM1$$Base;
@@ -90,10 +91,8 @@ void sys_info_init(void)
            (unsigned)(INITIAL_MSP - msp_val),
            (unsigned)(rw_len + zi_len + INITIAL_MSP - msp_val));
 
-    for (i = 0; i < SRAM_TOTAL_SIZE / 4; i++)
-    {
-        sram_base[i] = 0x00000000;
-    }
+    /* 注意: 不要全量清零 SRAM! 会擦掉插值表/MEM_TABLE等已初始化数据
+     * 各模块已通过 section(.bss.EXT_RAM) 自动清零, 或自行初始化 */
 
     dwt_init();
     g_last_measure_tick = HAL_GetTick();
@@ -133,22 +132,73 @@ void sys_info_update_ram(void)
 
 void sys_info_update_sram(void)
 {
-    uint32_t i;
-    uint8_t val;
-    uint32_t used_bytes = 0;
-    uint8_t *sram_base = (uint8_t *)0x68000000;
+    /* v1.6.2: SRAM 未就绪时跳过扫描, 防止 FSMC 未初始化导致 BusFault */
+    extern volatile uint8_t g_sram_ready;
+    if (!g_sram_ready) return;
 
-    for (i = 0; i < SRAM_TOTAL_SIZE; i += 256)
+    /* v1.5: 真实分区统计 + 剩余区域分片扫描
+     * 固定分区 (已知布局, 直接累加):
+     *   MEM_TABLE     = 128KB @ 0x68000000
+     *   LWIP_HEAP     =  64KB @ 0x68020000
+     *   PBUF_POOL     =  32KB @ 0x68030000
+     *   FIFO_EXT      =  64KB @ 0x68038000
+     *   LOG_BUF       =  64KB @ 0x68048000
+     *   STATIC_BUF    =  16KB @ 0x68058000
+     *   固定合计      = 368KB
+     * 剩余区域 (0x6805_C000 ~ 0x680F_FFFF, ~656KB):
+     *   分片扫描, 每次 1/10, 统计非 0/非 FF 的用量
+     */
+    #define SRAM_SCAN_SLICES    10
+    #define SRAM_FIXED_USED     (MEM_TABLE_SIZE + MEM_LWIP_HEAP_SIZE + MEM_PBUF_POOL_SIZE + MEM_FIFO_EXT_SIZE + MEM_LOG_SIZE + MEM_STATIC_BUF_SIZE)
+    #define SRAM_SCAN_START     (MEM_STATIC_BUF_ADDR + MEM_STATIC_BUF_SIZE)
+    #define SRAM_SCAN_END       (SRAM_BASE_ADDR + SRAM_TOTAL_SIZE)
+    #define SRAM_SCAN_TOTAL     (SRAM_SCAN_END - SRAM_SCAN_START)
+
+    static uint32_t s_slice_idx = 0;
+    static uint32_t s_used_accum = 0;
+
+    /* 防御: 如果 s_slice_idx 被栈溢出/内存损坏覆写, 重置 */
+    if (s_slice_idx >= SRAM_SCAN_SLICES) {
+        s_slice_idx = 0;
+        s_used_accum = 0;
+    }
+
+    uint32_t slice_size = SRAM_SCAN_TOTAL / SRAM_SCAN_SLICES;
+    uint32_t start = SRAM_SCAN_START + s_slice_idx * slice_size;
+
+    /* i 是绝对地址 (如 0x6805C000), 直接解引用, 不要再加 SRAM_BASE_ADDR */
+    for (uint32_t i = start; i < start + slice_size; i += 256)
     {
-        val = sram_base[i];
+        uint8_t val = *(volatile uint8_t *)i;
         if (val != 0xFF && val != 0x00)
         {
-            used_bytes += 256;
+            s_used_accum += 256;
         }
     }
 
-    g_sys_info.sram.used = used_bytes;
-    g_sys_info.sram.free = g_sys_info.sram.total - used_bytes;
+    s_slice_idx++;
+    if (s_slice_idx >= SRAM_SCAN_SLICES) {
+        /* 一轮扫描结束, 更新结果: 固定分区 + 扫描到的动态用量 */
+        g_sys_info.sram.used = SRAM_FIXED_USED + s_used_accum;
+        g_sys_info.sram.free = g_sys_info.sram.total - g_sys_info.sram.used;
+        s_used_accum = 0;
+        s_slice_idx = 0;
+
+        static uint32_t last_print = 0;
+        if (HAL_GetTick() - last_print >= 5000) {
+            last_print = HAL_GetTick();
+            /* v1.6.6: 暂时关闭 SRAM 调试打印, 减少串口噪音 */
+#if 0
+            printf("[DBG] SRAM: used=%uKB fixed=%uKB scan=%uKB free=%uKB (table=0x%02X heap=0x%02X)\r\n",
+                   (unsigned)(g_sys_info.sram.used / 1024),
+                   (unsigned)(SRAM_FIXED_USED / 1024),
+                   (unsigned)(s_used_accum / 1024),
+                   (unsigned)(g_sys_info.sram.free / 1024),
+                   (unsigned)((uint8_t *)MEM_TABLE_ADDR)[0],
+                   (unsigned)((uint8_t *)MEM_LWIP_HEAP_ADDR)[0]);
+#endif
+        }
+    }
 }
 
 void sys_info_update_cpu(void)
@@ -177,11 +227,19 @@ void sys_info_update_cpu(void)
 
 void sys_info_update(void)
 {
+    static uint32_t last_sram_update = 0;
+
     g_sys_info.uptime_ms = HAL_GetTick();
     sys_info_update_clk();
     sys_info_update_flash();
     sys_info_update_ram();
-    sys_info_update_sram();
+
+    /* SRAM 分片扫描: 每次 1/10 (<0.5ms), 每 500ms 调一次, 5s 扫完 1MB */
+    if (g_sys_info.uptime_ms - last_sram_update >= 500) {
+        last_sram_update = g_sys_info.uptime_ms;
+        sys_info_update_sram();
+    }
+
     sys_info_update_cpu();
 }
 

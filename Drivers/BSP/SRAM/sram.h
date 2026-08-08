@@ -4,16 +4,16 @@
  * @author      MZXQ
  * @version     V1.0
  * @date        2021-11-03
- * @brief       Íâ²¿SRAM Çý¶¯´úÂë
+ * @brief       ï¿½â²¿SRAM ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
  * @license     Copyright (c) 2020-2032, MZXQ
  ****************************************************************************************************
  * @attention
  *
- * ÊµÑéÆ½Ì¨:MZXQ F407¿ª·¢°å
+ * Êµï¿½ï¿½Æ½Ì¨:MZXQ F407ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
  *
- * ÐÞ¸ÄËµÃ÷
+ * ï¿½Þ¸ï¿½Ëµï¿½ï¿½
  * V1.0 20211103
- * µÚÒ»´Î·¢²¼
+ * ï¿½ï¿½Ò»ï¿½Î·ï¿½ï¿½ï¿½
  *
  ****************************************************************************************************
  */
@@ -22,50 +22,49 @@
 #define __SRAM_H
 
 #include "./SYSTEM/sys/sys.h"
+#include "bsp_config.h"   /* SRAM åœ°å€/åˆ†åŒºç»Ÿä¸€åœ¨ bsp_config.h å®šä¹‰ */
 
 
 /******************************************************************************************/
-/* SRAM WR/RD/CS Òý½Å ¶¨Òå 
- * SRAM_D0~D15 ¼° µØÖ·Ïß,ÓÉÓÚÒý½ÅÌ«¶à,¾Í²»ÔÚÕâÀï¶¨ÒåÁË,Ö±½ÓÔÚSRAM_initÀïÃæÐÞ¸Ä.ËùÒÔÔÚÒÆÖ²µÄÊ±ºò,
- * ³ýÁË¸ÄÕâ3¸öIO¿Ú, »¹µÃ¸ÄSRAM_initÀïÃæµÄ Êý¾ÝÏß ºÍ µØÖ·Ïß ËùÔÚµÄIO¿Ú.
+/* SRAM WR/RD/CS ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ 
+ * SRAM_D0~D15 ï¿½ï¿½ ï¿½ï¿½Ö·ï¿½ï¿½,ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ì«ï¿½ï¿½,ï¿½Í²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¶¨ï¿½ï¿½ï¿½ï¿½,Ö±ï¿½ï¿½ï¿½ï¿½SRAM_initï¿½ï¿½ï¿½ï¿½ï¿½Þ¸ï¿½.ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö²ï¿½ï¿½Ê±ï¿½ï¿½,
+ * ï¿½ï¿½ï¿½Ë¸ï¿½ï¿½ï¿½3ï¿½ï¿½IOï¿½ï¿½, ï¿½ï¿½ï¿½Ã¸ï¿½SRAM_initï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ ï¿½ï¿½Ö·ï¿½ï¿½ ï¿½ï¿½ï¿½Úµï¿½IOï¿½ï¿½.
  */
 
 #define SRAM_WR_GPIO_PORT               GPIOD
 #define SRAM_WR_GPIO_PIN                GPIO_PIN_5
-#define SRAM_WR_GPIO_CLK_ENABLE()       do{ __HAL_RCC_GPIOD_CLK_ENABLE(); }while(0)     /* ËùÔÚIO¿ÚÊ±ÖÓÊ¹ÄÜ */
+#ifndef SRAM_WR_GPIO_CLK_ENABLE
+#define SRAM_WR_GPIO_CLK_ENABLE()       do{ __HAL_RCC_GPIOD_CLK_ENABLE(); }while(0)
+#endif     /* ï¿½ï¿½ï¿½ï¿½IOï¿½ï¿½Ê±ï¿½ï¿½Ê¹ï¿½ï¿½ */
 
 #define SRAM_RD_GPIO_PORT               GPIOD
 #define SRAM_RD_GPIO_PIN                GPIO_PIN_4
-#define SRAM_RD_GPIO_CLK_ENABLE()       do{ __HAL_RCC_GPIOD_CLK_ENABLE(); }while(0)     /* ËùÔÚIO¿ÚÊ±ÖÓÊ¹ÄÜ */
+#ifndef SRAM_RD_GPIO_CLK_ENABLE
+#define SRAM_RD_GPIO_CLK_ENABLE()       do{ __HAL_RCC_GPIOD_CLK_ENABLE(); }while(0)
+#endif     /* ï¿½ï¿½ï¿½ï¿½IOï¿½ï¿½Ê±ï¿½ï¿½Ê¹ï¿½ï¿½ */
 
-/* SRAM_CS(ÐèÒª¸ù¾ÝSRAM_FSMC_NEXÉèÖÃÕýÈ·µÄIO¿Ú) Òý½Å ¶¨Òå */
+/* SRAM_CS(ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½SRAM_FSMC_NEXï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È·ï¿½ï¿½IOï¿½ï¿½) ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ */
 #define SRAM_CS_GPIO_PORT                GPIOG
 #define SRAM_CS_GPIO_PIN                 GPIO_PIN_10
-#define SRAM_CS_GPIO_CLK_ENABLE()        do{ __HAL_RCC_GPIOG_CLK_ENABLE(); }while(0)    /* ËùÔÚIO¿ÚÊ±ÖÓÊ¹ÄÜ */
+#ifndef SRAM_CS_GPIO_CLK_ENABLE
+#define SRAM_CS_GPIO_CLK_ENABLE()        do{ __HAL_RCC_GPIOG_CLK_ENABLE(); }while(0)
+#endif    /* ï¿½ï¿½ï¿½ï¿½IOï¿½ï¿½Ê±ï¿½ï¿½Ê¹ï¿½ï¿½ */
 
-/* FSMCÏà¹Ø²ÎÊý ¶¨Òå 
- * ×¢Òâ: ÎÒÃÇÄ¬ÈÏÊÇÍ¨¹ýFSMC¿é3À´Á¬½ÓSRAM, ¿é1ÓÐ4¸öÆ¬Ñ¡: FSMC_NE1~4
- *
- * ÐÞ¸ÄSRAM_FSMC_NEX, ¶ÔÓ¦µÄSRAM_CS_GPIOÏà¹ØÉèÖÃÒ²µÃ¸Ä
+/* FSMC å¯„å­˜å™¨å® (SRAM_FSMC_NEX ç»Ÿä¸€åœ¨ bsp_config.h å®šä¹‰)
+ * æ³¨æ„: é»˜è®¤é€šè¿‡ FSMC ç¬¬3ä¸ªç‰‡é€‰æŽ¥ SRAM, å¯æ”¹èŒƒå›´ 1~4
+ * ä¿®æ”¹ SRAM_FSMC_NEX æ—¶, éœ€åŒæ­¥ä¿®æ”¹ bsp_config.h ä¸­çš„ SRAM_CS_GPIO é…ç½®
  */
-#define SRAM_FSMC_NEX           3         /* Ê¹ÓÃFSMC_NE3½ÓSRAM_CS,È¡Öµ·¶Î§Ö»ÄÜÊÇ: 1~4 */
-
-#define SRAM_FSMC_BCRX          FSMC_Bank1->BTCR[(SRAM_FSMC_NEX - 1) * 2]       /* BCR¼Ä´æÆ÷,¸ù¾ÝSRAM_FSMC_NEX×Ô¶¯¼ÆËã */
-#define SRAM_FSMC_BTRX          FSMC_Bank1->BTCR[(SRAM_FSMC_NEX - 1) * 2 + 1]   /* BTR¼Ä´æÆ÷,¸ù¾ÝSRAM_FSMC_NEX×Ô¶¯¼ÆËã */
-#define SRAM_FSMC_BWTRX         FSMC_Bank1E->BWTR[(SRAM_FSMC_NEX - 1) * 2]      /* BWTR¼Ä´æÆ÷,¸ù¾ÝSRAM_FSMC_NEX×Ô¶¯¼ÆËã */
+#define SRAM_FSMC_BCRX          FSMC_Bank1->BTCR[(SRAM_FSMC_NEX - 1) * 2]       /* BCR å¯„å­˜å™¨, æ ¹æ® SRAM_FSMC_NEX è‡ªåŠ¨è®¡ç®— */
+#define SRAM_FSMC_BTRX          FSMC_Bank1->BTCR[(SRAM_FSMC_NEX - 1) * 2 + 1]   /* BTR å¯„å­˜å™¨ */
+#define SRAM_FSMC_BWTRX         FSMC_Bank1E->BWTR[(SRAM_FSMC_NEX - 1) * 2]      /* BWTR å¯„å­˜å™¨ */
 
 /******************************************************************************************/
 
-/* SRAM»ùµØÖ·, ¸ù¾Ý SRAM_FSMC_NEX µÄÉèÖÃÀ´¾ö¶¨»ùÖ·µØÖ·
- * ÎÒÃÇÒ»°ãÊ¹ÓÃFSMCµÄ¿é1(BANK1)À´Çý¶¯SRAM, ¿é1µØÖ··¶Î§×Ü´óÐ¡Îª256MB,¾ù·Ö³É4¿é:
- * ´æ´¢¿é1(FSMC_NE1)µØÖ··¶Î§: 0X6000 0000 ~ 0X63FF FFFF
- * ´æ´¢¿é2(FSMC_NE2)µØÖ··¶Î§: 0X6400 0000 ~ 0X67FF FFFF
- * ´æ´¢¿é3(FSMC_NE3)µØÖ··¶Î§: 0X6800 0000 ~ 0X6BFF FFFF
- * ´æ´¢¿é4(FSMC_NE4)µØÖ··¶Î§: 0X6C00 0000 ~ 0X6FFF FFFF
+/* SRAM_BASE_ADDR ç»Ÿä¸€ç”± bsp_config.h å®šä¹‰ (0x68000000, FSMC Bank3 NE3)
+ * å¦‚éœ€ä¿®æ”¹åœ°å€/ç‰‡é€‰, è¯·åœ¨ bsp_config.h ä¸­åŒæ­¥ä¿®æ”¹ SRAM_FSMC_NEX å’Œç›¸å…³ GPIO é…ç½®
  */
-#define SRAM_BASE_ADDR         (0X60000000 + (0X4000000 * (SRAM_FSMC_NEX - 1)))
 
-extern SRAM_HandleTypeDef g_sram_handler;    /* SRAM¾ä±ú */
+extern SRAM_HandleTypeDef g_sram_handler;    /* SRAMå¥æŸ„ */
 
 
 void sram_init(void);

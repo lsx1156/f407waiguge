@@ -28,6 +28,9 @@ extern IWDG_HandleTypeDef  hiwdg;
 #define g_eth_handle    heth
 #define g_sram_handler  hsram1
 
+/* v1.6.2: SRAM 就绪标志, sram_init() 后置 1, sys_info_update_sram() 前检查 */
+extern volatile uint8_t g_sram_ready;
+
 /* ========== GPIO Pin Macros (from bsp_config.h) ========== */
 /* LED */
 #define LED0_PIN    GPIO_PIN_9
@@ -40,7 +43,7 @@ extern IWDG_HandleTypeDef  hiwdg;
 #define EN_LEG_L_PORT       GPIOC
 #define EN_LEG_R_PIN        GPIO_PIN_7
 #define EN_LEG_R_PORT       GPIOC
-#define EN_ARM_1_PIN        GPIO_PIN_4
+#define EN_ARM_1_PIN        GPIO_PIN_6
 #define EN_ARM_1_PORT       GPIOE
 #define EN_ARM_2_PIN        GPIO_PIN_5
 #define EN_ARM_2_PORT       GPIOE

@@ -42,7 +42,9 @@ uint8_t eeprom_read_byte(uint16_t addr)
 void eeprom_write_byte(uint16_t addr, uint8_t data)
 {
     HAL_I2C_Mem_Write(&g_i2c1_handle, EEPROM_I2C_ADDR, addr, I2C_MEMADD_SIZE_8BIT, &data, 1, 100);
-    HAL_Delay(5);
+    /* 注意: 去掉 HAL_Delay(5) 阻塞等待!
+     * 如果连续调用 eeprom_write_byte(), 调用者需自己保证 5ms 间隔
+     * (或使用 eeprom_write_buffer() 走异步写入队列) */
 }
 
 void eeprom_read_buffer(uint16_t addr, uint8_t *buf, uint16_t len)

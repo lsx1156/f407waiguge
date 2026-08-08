@@ -338,9 +338,9 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls></MiscControls>
-              <Define>USE_HAL_DRIVER,STM32F407xx,DATA_IN_ExtSRAM</Define>
+              <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>..\..\User;..\..\App\bsp;..\..\App\can_motor;..\..\App\control;..\..\App\eeprom;..\..\App\interp;..\..\App\safety;..\..\App\udp_proto;..\..\Drivers;..\..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\..\Drivers\CMSIS\Include;..\..\Drivers\STM32F4xx_HAL_Driver\Inc;..\..\Middlewares;..\..\Middlewares\arch;..\..\Middlewares\src\include;..\..\Middlewares\src\include\lwip;..\..\Middlewares\src\include\ipv4</IncludePath>
+              <IncludePath>..\..\User;..\..\App\bsp;..\..\App\can_motor;..\..\App\control;..\..\App\eeprom;..\..\App\interp;..\..\App\safety;..\..\App\udp_proto;..\..\Drivers;..\..\Drivers\CMSIS\Device\ST\STM32F4xx\Include;..\..\Drivers\CMSIS\Include;..\..\Drivers\STM32F4xx_HAL_Driver\Inc;..\..\Middlewares;..\..\Middlewares\arch;..\..\Middlewares\src\include;..\..\Middlewares\src\include\lwip;..\..\Middlewares\src\include\ipv4;..\..\Middlewares\LZ4</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -630,9 +630,34 @@
               <FilePath>..\..\App\control\control_isr.c</FilePath>
             </File>
             <File>
+              <FileName>mode_manager.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\App\control\mode_manager.c</FilePath>
+            </File>
+            <File>
               <FileName>tasks.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\..\App\control\tasks.c</FilePath>
+            </File>
+            <File>
+              <FileName>joint_unit.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\App\control\joint_unit.c</FilePath>
+            </File>
+            <File>
+              <FileName>global_coordinator.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\App\control\global_coordinator.c</FilePath>
+            </File>
+            <File>
+              <FileName>global_phase.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\App\control\global_phase.c</FilePath>
+            </File>
+            <File>
+              <FileName>global_pose.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\App\control\global_pose.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -643,6 +668,11 @@
               <FileName>eeprom.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\..\App\eeprom\eeprom.c</FilePath>
+            </File>
+            <File>
+              <FileName>eeprom_params.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\App\eeprom\eeprom_params.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -893,6 +923,16 @@
               <FileName>readme.txt</FileName>
               <FileType>5</FileType>
               <FilePath>..\..\readme.txt</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>LZ4</GroupName>
+          <Files>
+            <File>
+              <FileName>lz4.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\Middlewares\LZ4\lz4.c</FilePath>
             </File>
           </Files>
         </Group>

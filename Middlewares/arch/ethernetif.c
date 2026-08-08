@@ -56,6 +56,7 @@
 #include "netif/ppp/pppoe.h"
 #endif
 #include "ethernetif.h"
+#include "ethernet.h"
 #include "lwip_comm.h"
 #include "main.h"
 #include "string.h"
@@ -107,7 +108,83 @@ low_level_init(struct netif *netif)
 
     netif->mtu = 1500;
 
-    netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
+    netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_LINK_UP;
+
+    /* ===== v1.5: 手动初始化 DMA 描述符链 (比 HAL 更可控) =====
+     * 关键: 所有权位(OWN)、缓冲区地址、链表指针必须全部正确,
+     *       且 MPU 已允许 DMA 访问该区域 (mpu_config.c Region 5). */
+
+    /* --- Rx Descriptors: 所有权归 DMA (OWN=1), 环形链表 --- */
+    for (int i = 0; i < ETH_RXBUFNB; i++) {
+        g_eth_dma_rx_dscr_tab[i].Status = ETH_DMARXDESC_OWN;  /* 归 DMA 所有 */
+        /* RCH=Return Chained (用第二地址指向下一个描述符), 缓冲区大小 */
+        g_eth_dma_rx_dscr_tab[i].ControlBufferSize = ETH_DMARXDESC_RCH | ETH_RX_BUF_SIZE;
+        g_eth_dma_rx_dscr_tab[i].Buffer1Addr = (uint32_t)&g_eth_rx_buf[i][0];
+        /* 链接下一个描述符, 最后一个指向第一个 (环形) */
+        g_eth_dma_rx_dscr_tab[i].Buffer2NextDescAddr =
+            (i < ETH_RXBUFNB - 1) ? (uint32_t)&g_eth_dma_rx_dscr_tab[i + 1]
+                                   : (uint32_t)&g_eth_dma_rx_dscr_tab[0];
+    }
+    g_eth_handle.Instance->DMARDLAR = (uint32_t)&g_eth_dma_rx_dscr_tab[0];
+
+    /* --- Tx Descriptors: 所有权归 CPU (OWN=0), 环形链表 --- */
+    for (int i = 0; i < ETH_TXBUFNB; i++) {
+        /* TCH=Second Address Chained (链式), 校验和由硬件插入 */
+        g_eth_dma_tx_dscr_tab[i].Status = ETH_DMATXDESC_TCH
+                                         | ETH_DMATXDESC_CHECKSUMTCPUDPICMPFULL;
+        g_eth_dma_tx_dscr_tab[i].Buffer1Addr = (uint32_t)&g_eth_tx_buf[i][0];
+        g_eth_dma_tx_dscr_tab[i].Buffer2NextDescAddr =
+            (i < ETH_TXBUFNB - 1) ? (uint32_t)&g_eth_dma_tx_dscr_tab[i + 1]
+                                   : (uint32_t)&g_eth_dma_tx_dscr_tab[0];
+    }
+    g_eth_handle.Instance->DMATDLAR = (uint32_t)&g_eth_dma_tx_dscr_tab[0];
+
+    /* 同步 handle 的描述符指针, HAL 发送/接收函数要用 */
+    g_eth_handle.RxDesc = g_eth_dma_rx_dscr_tab;
+    g_eth_handle.TxDesc = g_eth_dma_tx_dscr_tab;
+
+    printf("[ETH] DMARDLAR=0x%08lX DMATDLAR=0x%08lX\r\n",
+           (unsigned long)g_eth_handle.Instance->DMARDLAR,
+           (unsigned long)g_eth_handle.Instance->DMATDLAR);
+
+    /* 启动 MAC/DMA */
+    if (HAL_ETH_Start(&g_eth_handle) != HAL_OK) {
+        printf("[ETH] HAL_ETH_Start FAILED\r\n");
+    } else {
+        printf("[ETH] HAL_ETH_Start OK\r\n");
+    }
+
+    /* 保险: 强制拉起 MAC TE/RE 和 DMA ST/SR (HAL_ETH_Start 理论上已做) */
+    g_eth_handle.Instance->MACCR |= ETH_MACCR_TE | ETH_MACCR_RE;
+    g_eth_handle.Instance->DMAOMR |= ETH_DMAOMR_ST | ETH_DMAOMR_SR;
+    g_eth_handle.Instance->DMAIER |= ETH_DMAIER_NISE | ETH_DMAIER_RIE | ETH_DMAIER_TIE;
+
+    /* 等待 DMA 进程跑起来 (最多 10ms)
+     * DMASR.RPS (bit17-18) = 01 -> Rx Running
+     * DMASR.TPS (bit20-21) = 01 -> Tx Running */
+    {
+        uint32_t tick = HAL_GetTick();
+        while (((g_eth_handle.Instance->DMASR & ETH_DMASR_RPS) >> 17) != 1 ||
+               ((g_eth_handle.Instance->DMASR & ETH_DMASR_TPS) >> 20) != 1) {
+            if (HAL_GetTick() - tick > 10) {
+                printf("[ETH] WARNING: DMA Start Timeout (RPS=%d TPS=%d)\r\n",
+                       (int)((g_eth_handle.Instance->DMASR & ETH_DMASR_RPS) >> 17),
+                       (int)((g_eth_handle.Instance->DMASR & ETH_DMASR_TPS) >> 20));
+                break;
+            }
+        }
+    }
+
+    printf("[ETH] Final: MACCR=0x%08lX (TE=%d RE=%d) DMAOMR=0x%08lX (ST=%d SR=%d) DMASR=0x%08lX (RPS=%d TPS=%d)\r\n",
+           (unsigned long)g_eth_handle.Instance->MACCR,
+           (int)((g_eth_handle.Instance->MACCR >> 3) & 1),
+           (int)((g_eth_handle.Instance->MACCR >> 2) & 1),
+           (unsigned long)g_eth_handle.Instance->DMAOMR,
+           (int)((g_eth_handle.Instance->DMAOMR >> 13) & 1),
+           (int)((g_eth_handle.Instance->DMAOMR >> 1) & 1),
+           (unsigned long)g_eth_handle.Instance->DMASR,
+           (int)((g_eth_handle.Instance->DMASR >> 17) & 3),
+           (int)((g_eth_handle.Instance->DMASR >> 20) & 3));
 
     g_last_link_check_tick = 0;
     g_link_stable_cnt = 0;
@@ -220,6 +297,12 @@ error:
  * @return a pbuf filled with the received packet (including MAC header)
  *         NULL on memory error
  */
+volatile uint32_t g_dbg_eth_rx_frames = 0;
+volatile uint32_t g_dbg_eth_input_calls = 0;
+volatile uint32_t g_dbg_eth_getframe_fail = 0;
+volatile uint32_t g_dbg_eth_dmasr = 0;
+volatile uint32_t g_dbg_eth_desc0_status = 0;
+
 static struct pbuf *
 low_level_input(struct netif *netif)
 {  
@@ -232,10 +315,21 @@ low_level_input(struct netif *netif)
     uint32_t byteslefttocopy = 0;
     uint32_t i = 0;
   
-    if (HAL_ETH_GetReceivedFrame(&g_eth_handle) != HAL_OK)  /* �ж��Ƿ���յ����� */
-    return NULL;
+    if (HAL_ETH_GetReceivedFrame(&g_eth_handle) != HAL_OK) {
+        g_dbg_eth_getframe_fail++;
+        /* 每 1 秒记录一次 DMA 状态 */
+        static uint32_t last_dbg = 0;
+        if (HAL_GetTick() - last_dbg >= 1000) {
+            last_dbg = HAL_GetTick();
+            g_dbg_eth_dmasr = g_eth_handle.Instance->DMASR;
+            g_dbg_eth_desc0_status = g_eth_handle.RxDesc->Status;
+        }
+        return NULL;
+    }
     
-    len = g_eth_handle.RxFrameInfos.length;                /* ��ȡ���յ�����̫��֡���� */
+    g_dbg_eth_rx_frames++;
+    
+    len = g_eth_handle.RxFrameInfos.length;                /* 获取接收到的以太网帧长度 */
     
 #if ETH_PAD_SIZE
   len += ETH_PAD_SIZE; /* allow room for Ethernet padding */
@@ -284,24 +378,22 @@ low_level_input(struct netif *netif)
         MIB2_STATS_NETIF_INC(netif, ifindiscards);
     }
     
-    /* �ͷ�DMA������ */
+    /* v1.6.3+fix: 释放DMA描述符后无条件重启Rx DMA (解决RPS/RBU导致的8万+rx_fail+92%CPU占用) */
     dmarxdesc = g_eth_handle.RxFrameInfos.FSRxDesc;
     
     for (i = 0;i < g_eth_handle.RxFrameInfos.SegCount; i ++)
     {  
-        dmarxdesc->Status |= ETH_DMARXDESC_OWN;       /* �����������DMA���� */
+        dmarxdesc->Status |= ETH_DMARXDESC_OWN;
         dmarxdesc = (ETH_DMADescTypeDef *)(dmarxdesc->Buffer2NextDescAddr);
     }
     
-    g_eth_handle.RxFrameInfos.SegCount = 0;           /* ����μ����� */
-    
-    if ((g_eth_handle.Instance->DMASR & ETH_DMASR_RBUS) != (uint32_t)RESET)  /* ���ջ����������� */
-    {
-        /* ������ջ����������ñ�־ */
+    g_eth_handle.RxFrameInfos.SegCount = 0;
+
+    /* RBUS 清除 + 无条件写 DMARPDR 任何值确保 Rx DMA 重新轮询描述符 */
+    if ((g_eth_handle.Instance->DMASR & ETH_DMASR_RBUS) != (uint32_t)RESET) {
         g_eth_handle.Instance->DMASR = ETH_DMASR_RBUS;
-        /* �����ջ����������õ�ʱ��RxDMA���ȥ����״̬��ͨ����DMARPDRд������һ��ֵ������Rx DMA */
-        g_eth_handle.Instance->DMARPDR = 0;
     }
+    g_eth_handle.Instance->DMARPDR = 0;   /* 强制 Rx DMA 脱离 RPS(停止) 状态, 不再依赖 RBUS 标志 */
     
     return p;
 }
@@ -319,6 +411,8 @@ void
 ethernetif_input(struct netif *netif)
 {
     struct pbuf *p;
+
+    g_dbg_eth_input_calls++;
 
     /* move received packet into a new pbuf */
     p = low_level_input(netif);
