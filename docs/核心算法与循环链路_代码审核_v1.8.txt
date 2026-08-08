@@ -1,0 +1,1932 @@
+================================================================
+ STM32F407 外骨骼控制系统 — 核心算法与循环链路 代码审核
+================================================================
+ 版本: v1.8
+ 日期: 2026-08-08
+ 用途: 人工代码审核 (源码原样汇编, 供人工逐行核对)
+ 硬约束: 单芯片 (STM32F407) / 无 IMU / 仅 ABS 编码器 + 相电流 + CAN
+ 说明: 本文件由各源文件原样拼接, 代码未做任何改动/重排/删注。
+================================================================
+
+
+======== 章节名: JointUnit 标准化接口与漂移免疫状态定义 ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\joint_unit.h
+/**
+ * @file joint_unit.h
+ * @brief JointUnit 标准化关节接口 (架构评审 #2)
+ *
+ * 统一封装 6 个关节的:
+ *   - 身份:     CAN bus / motor_id / 关节类型 / 名称
+ *   - 硬件映射: EN 使能引脚 (拉低 = 切断驱动级)
+ *   - 软限位:   位置上下限 (mdeg)
+ *   - 运行时状态引用: status / ABO / assist_torque
+ *
+ * 消除 control_isr.c / tasks.c 中散落的隐式知识:
+ *   i<2 ? g_leg_status[i] : g_arm_status[i-2]
+ *   push_can_tx(0, MOTOR_LEG_0_ID, ...)
+ *   HAL_GPIO_WritePin(EN_LEG_L_PORT, EN_LEG_L_PIN, ...)
+ *   idx = tmp.joint_id - MOTOR_ARM_0_ID
+ *
+ * 配置部分编译期固定; 运行时状态通过指针引用 control_isr.c 中的既有全局数组,
+ * 零内存迁移, 不破坏既有访问路径 (g_leg_status / g_arm_status / g_abo_state 仍可直用).
+ */
+#ifndef __JOINT_UNIT_H__
+#define __JOINT_UNIT_H__
+
+#include "contract.h"
+#include "bsp_config.h"
+#include "stm32f4xx_hal.h"
+#include "control_isr.h"   /* CanTxEntry_t, can_tx_fifo_write, g_leg/g_arm_status, g_abo_state */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ===== 关节类型 ===== */
+typedef enum {
+    JOINT_TYPE_LEG_HIP      = 0,   /* 下肢髋关节 (CAN1, CyberGear) */
+    JOINT_TYPE_ARM_SHOULDER = 1,   /* 上肢肩关节 (CAN2, RS01) */
+    JOINT_TYPE_ARM_ELBOW    = 2,   /* 上肢肘关节 (CAN2, RS01) */
+} JointType_e;
+
+/* ===== CAN 总线选择 ===== */
+typedef enum {
+    JOINT_BUS_CAN1 = 0,            /* CyberGear 下肢 */
+    JOINT_BUS_CAN2 = 1,            /* RS01 上肢 */
+} JointBus_e;
+
+/* ===== 零 IMU 漂移免疫包：编译开关 ===== */
+#ifndef DRIFT_IMMUNE_ENABLE
+#define DRIFT_IMMUNE_ENABLE     1   /* 1=开启, 0=关闭 (保留原有 ABO 路径) */
+#endif
+
+/* ====== 力矩零漂补偿 (§A, 分布式单关节内部) ======
+ * 仅用 RobStride 01 原生 ABS 编码器 + 温度 + 电流反馈，无 IMU。 */
+#define TEMP_TABLE_SIZE         21   /* -20~80°C, 每 5°C 一个点 */
+#define TEMP_TABLE_STEP_C       5
+#define TEMP_TABLE_MIN_C        (-20)
+
+typedef struct {
+    /* 出厂烧录：不同温度下的电流零漂补偿值 (Nm) */
+    float    temp_coeff[TEMP_TABLE_SIZE];
+
+    /* 实时中间量 */
+    float    current_zero_thermal;   /* 温度补偿后的零点 (Nm) */
+    float    current_zero_est;       /* 在线估计的零点 (Nm, EMA) */
+
+    /* 零负载窗口检测 */
+    uint16_t zero_load_window_cnt;   /* 连续「疑似零负载」计数 (ms) */
+    uint8_t  zero_calib_valid;       /* 在线标定是否可信 */
+
+    /* 阈值 (Nm / rad/s, 可按关节类型调参) */
+    float    thr_tau_zero_load;      /* 零负载力矩阈值 (Nm) */
+    float    thr_vel_zero_load;      /* 零负载速度阈值 (rad/s) */
+} TorqueDriftComp_t;
+
+/* ====== 3 阶 ESO 抗漂移 (§B, 分布式单关节核心) ======
+ * 模型前馈剥离已知动力学 + 自适应遗忘 beta3 + 无激励冻结。
+ * 状态量 float: STM32F407 带 VFPv4-SP，1kHz 单精度浮点可承载。 */
+typedef struct {
+    float z1;    /* 位置估计 (rad) */
+    float z2;    /* 速度估计 (rad/s) */
+    float z3;    /* 总扰动估计 (Nm) → 输出 tau_human */
+
+    float vel_prev;      /* 上一拍速度 (rad/s)，用于加速度微分 */
+    float payload_est;   /* 全局层下发的负载扭矩前馈 (Nm) */
+    float tau_model_prev;/* 上一拍模型前馈 (Nm)，调试用 */
+} ESO3State_t;
+
+/* ====== 单关节静态参数 (ESO / 动力学) ======
+ * 未来可由参数热加载 JSON 覆盖，此处给出 RobStride 01 40Nm 关节默认值。 */
+typedef struct {
+    float J_rotor;           /* 转子 + 连杆折算惯量 (kg·m²) */
+    float friction_viscous;  /* 粘性摩擦 (Nm·s/rad) */
+    float friction_coulomb;  /* 库仑摩擦 (Nm) */
+    float torque_const;      /* 力矩常数 (Nm/A) */
+    float gear_ratio;        /* 减速比 */
+
+    /* ESO 3 阶带宽参数 (β1, β2, β3) */
+    float eso_beta[3];
+
+    /* 重力臂 (mgL, Nm) — MGL*cos(θ) 做重力前馈
+     * 肩/髋：正值；肘：0 或小值由零位标定后启用 */
+    float mgl;
+
+    /* §E 重力力矩臂向量 (Nm/g, 即 kg·m) — grav_arm · g_base * 9.81 得重力扭矩
+     * 出厂标定 (步骤4) 烧录; 默认全 0 → 退化为位置依赖 mgl*cos(q) 形式 */
+    float grav_arm[3];
+
+    /* 机械零位偏移 (rad) — 出厂标定 θ0，使 G(pos)=MGL*cos(pos + θ0) 对齐 */
+    float theta0_rad;
+
+    /* §D 导纳/阻抗基值 (被 global_adm_scale 实时缩放) */
+    float adm_M_base;       /* 惯量 (kg·m²) */
+    float adm_B_base;       /* 阻尼 (Nm·s/rad) */
+    float adm_K_base;       /* 刚度 (Nm/rad) */
+
+    /* 无激励检测阈值 */
+    float thr_vel_noexc;     /* rad/s */
+    float thr_tau_noexc;     /* Nm */
+    float thr_res_noexc;     /* Nm */
+} JointUnitParams_t;
+
+/* ====== 单关节运行时状态 (§A + §B) ======
+ * 每关节一个实例，纯 C，零全局变量依赖 (与架构评审一致)。 */
+typedef struct {
+    TorqueDriftComp_t drift;
+    ESO3State_t       eso3;
+    JointUnitParams_t params;
+
+    /* 输入/输出镜像 (与既有 status/abo/assist_torque 指针解耦) */
+    float pos_rad;         /* 最新反馈位置 (rad) */
+    float vel_rad_s;       /* 最新反馈速度 (rad/s) */
+    float tau_meas_nm;     /* 去零漂后的反馈力矩 (Nm) */
+    float tau_human_nm;    /* ESO 输出人力估计 (Nm) */
+    float tau_cmd_nm;      /* 导纳输出的目标力矩 (Nm, 可选) */
+
+    /* §D 导纳控制器状态 (1kHz) */
+    float adm_pos;         /* 导纳位置积分 (rad) */
+    float adm_vel;         /* 导纳速度 (rad/s) */
+
+    /* §E 基座系重力向量指针 → global_pose.gravity_base (float[3], 归一化)
+     *   NULL → 退化为直立假设; 非 NULL → 送入 tau_model_forward 重力项 */
+    const float *gravity_base_ptr;
+
+    /* 故障/状态标志 */
+    uint8_t eso_enable;    /* 1=ESO3 启用, 0=保留 legacy ABO */
+    uint8_t eso_div_flag;  /* ESO 发散监测: 1=触发 */
+
+    /* §C-boost: 负载突变 (抓取/放下) 时触发, ESO3 暂时增大 beta3 + 遗忘旧 z3 */
+    uint8_t  eso_boost_mode;    /* 1=boost 激活 */
+    uint16_t eso_boost_timer;   /* boost 剩余时间 (ms), 1kHz 递减; 0=结束 */
+
+    /* §D: 全局相位调度器下发的导纳/阻抗缩放 (复合 K/B 因子)
+     *   adm_scale=1.0 → 默认; <1.0 → 降刚度/阻尼 (透明); >1.0 → 增阻尼 (稳) */
+    float global_adm_scale;
+} JointUnitState_t;
+
+/* 全局单关节实例数组 (每关节一个) */
+extern JointUnitState_t g_joint_state[JOINT_COUNT];
+
+/* ===== 关节单元 =====
+ * 配置字段编译期固定; status/abo/assist_torque 指针引用既有全局,
+ * 经 const JointUnit_t 仍可修改其指向内容 (指针本身不变). */
+typedef struct {
+    /* ---- 身份与硬件映射 (const) ---- */
+    JointBus_e      bus;
+    uint32_t        motor_id;        /* CAN motor ID */
+    JointType_e     type;
+    const char     *name;
+    GPIO_TypeDef   *en_port;         /* 使能引脚 (拉低 = 切断驱动) */
+    uint16_t        en_pin;
+    uint16_t        control_period;  /* 控制周期 (ms) */
+    int32_t         soft_limit_min;  /* 软限位下限 (mdeg) */
+    int32_t         soft_limit_max;  /* 软限位上限 (mdeg) */
+
+    /* ---- 运行时状态指针 (引用既有全局, 可变内容) ---- */
+    JointStatus_t  *status;          /* -> g_leg_status / g_arm_status */
+    ABOState_t     *abo;             /* -> g_abo_state[idx] */
+    int32_t        *assist_torque;   /* -> g_abo_assist_torque[idx] */
+
+    /* ---- 新增: 指向零 IMU 漂移状态 (非 wire-format) ---- */
+    JointUnitState_t *state;         /* -> g_joint_state[idx] */
+} JointUnit_t;
+
+/* ===== 关节总数 (2 腿 + 4 臂) ===== */
+#define JOINT_COUNT         MOTOR_COUNT_TOTAL
+
+/* 配置表 (唯一身份/硬件映射来源) */
+extern const JointUnit_t g_joint[JOINT_COUNT];
+
+/* ===== API ===== */
+void                  joint_unit_init(void);
+
+const JointUnit_t    *joint_get(uint8_t idx);          /* 越界返回 NULL */
+uint8_t               joint_count(void);
+
+/* 便捷访问器 (越界返回 NULL) */
+JointStatus_t        *joint_status_ptr(uint8_t idx);
+ABOState_t           *joint_abo_ptr(uint8_t idx);
+int32_t              *joint_assist_ptr(uint8_t idx);
+JointUnitState_t    *joint_runtime_ptr(uint8_t idx);   /* 新增 */
+CAN_HandleTypeDef    *joint_bus_handle(uint8_t idx);
+JointType_e           joint_type(uint8_t idx);
+uint8_t               joint_is_leg(uint8_t idx);       /* idx 0,1 → 1 */
+uint8_t               joint_is_arm(uint8_t idx);       /* idx 2~5 → 1 */
+
+/* 反向查找: motor_id → joint idx (未找到返回 0xFF) */
+uint8_t               joint_idx_from_motor_id(uint32_t motor_id);
+
+/* 硬件操作 */
+void                  joint_push_tx(uint8_t idx, int32_t target, uint8_t mode);  /* 入 CAN TX FIFO */
+void                  joint_disable_hw(uint8_t idx);                              /* 拉低 EN pin */
+
+/* ===== 零 IMU 漂移免疫包 公共 API (1kHz ISR 调用) ===== */
+#if DRIFT_IMMUNE_ENABLE
+
+/* 1kHz 周期内对单关节的完整漂移免疫更新
+ *   1. TorqueDrift_Update1kHz        (§A)
+ *   2. JointUnit_ESO3_Update1kHz     (§B)
+ * 调用时机: 在 abo_update_one 之前或作为其替代 (eso_enable 标志控制) */
+void joint_drift_immune_update1kHz(uint8_t idx, float dt_s);
+
+/* 供全局协调器下发 payload 扭矩前馈 (§C) */
+void joint_set_payload_est(uint8_t idx, float payload_torque_nm);
+
+/* §C-boost: 触发某关节 ESO boost (负载突变时快速收敛 z3)
+ *   duration_ms: boost 持续时间, 1kHz 递减 */
+void joint_trigger_eso_boost(uint8_t idx, uint16_t duration_ms);
+
+/* §C-boost: 1kHz 递减 boost timer (在 ISR 内调用) */
+void joint_eso_boost_tick_1kHz(void);
+
+/* §E: 绑定基座系重力向量指针 (上电一次, g_base_ptr 指向 float[3]) */
+void joint_bind_gravity_vector(uint8_t idx, const float *g_base_ptr);
+
+/* 获取 ESO3 人力估计 (Nm), 负值表示反方向 */
+float joint_get_human_torque_nm(uint8_t idx);
+
+#endif /* DRIFT_IMMUNE_ENABLE */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __JOINT_UNIT_H__ */
+
+======== 章节名: §A 力矩零漂 + §B ESO3 + §D 导纳 + §E 重力向量 (1kHz 分布式单关节) ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\joint_unit.c
+/**
+ * @file joint_unit.c
+ * @brief JointUnit 标准化关节接口实现 (架构评审 #2)
+ *
+ * 零 IMU 漂移免疫包 (§A + §B) 也落在本文件：
+ *   §A  TorqueDrift_Update1kHz    : 温度表插值 + 零负载窗口在线标定
+ *   §B  JointUnit_ESO3_Update1kHz : 3 阶 ESO + 模型前馈 + 自适应 beta3 + 无激励冻结
+ *
+ * 配置表 g_joint[] 编译期固定, 引用 control_isr.c 既有全局:
+ *   g_leg_status[2] / g_arm_status[4] / g_abo_state[6] / g_abo_assist_torque[6]
+ * 零内存迁移, 既有全局仍可独立访问, 本表为新增的统一入口.
+ */
+#include "joint_unit.h"
+#include "main.h"       /* hcan1 / hcan2 */
+#include "safety.h"     /* ARM_SHOULDER/ELBOW 软限位 */
+#include "bsp_config.h"
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+
+/* ===== 单位转换常量 (与 control_isr.c 保持一致) ===== */
+#define MDEG_TO_RAD_F        (1.7453292519943295e-05f)   /* mdeg → rad, π/(180*1000) */
+#define RAD_TO_MDEG_F        (57295.77951308232f)        /* rad → mdeg        */
+#define MNM_TO_NM_F          (0.001f)                     /* mNm → Nm           */
+#define NM_TO_MNM_F          (1000.0f)                    /* Nm → mNm           */
+
+/* ===== 全局单关节运行时状态数组 (零 IMU 漂移免疫包) ===== */
+JointUnitState_t g_joint_state[JOINT_COUNT];
+
+/* ===== 默认出厂温度零漂表 (TEMP_TABLE_SIZE = 21, -20~80°C / 5°C step)
+ * 冷启动先用出厂表; 每关节热箱标定后可通过 eeprom_params 热加载覆盖.
+ * 默认值全 0 (表示"未出厂标定", 仅靠在线窗口校准) */
+static const float g_default_temp_coeff[TEMP_TABLE_SIZE] = {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+};
+
+/* ===== 默认 RobStride 01 40Nm 关节参数 (待 JSON 热加载覆盖) =====
+ * 保守估计, 仅用作启用 ESO3 前的默认值. */
+static void joint_params_set_default(JointUnitParams_t *p, JointType_e type)
+{
+    p->J_rotor          = 0.00012f;    /* 转子 + 连杆折算惯量, 保守值 (kg·m²) */
+    p->friction_viscous = 0.008f;      /* 粘性摩擦 (Nm·s/rad) */
+    p->friction_coulomb = 0.45f;       /* 库仑摩擦 (Nm) */
+    p->torque_const     = 0.18f;       /* 力矩常数 (Nm/A) */
+    p->gear_ratio       = 54.0f;       /* 减速比 */
+
+    /* ESO 带宽: β1=1200, β2=80000, β3=5e5 (连续域, 此处直接用 1kHz 欧拉离散) */
+    p->eso_beta[0] = 1200.0f;
+    p->eso_beta[1] = 80000.0f;
+    p->eso_beta[2] = 500000.0f;
+
+    /* 重力前馈 + 零位 (出厂 θ₀=0, 需现场标定后再覆盖启用)
+     *   髋: 0 (步态时下肢重力由 ABO 偏置吸收)
+     *   肩: 保守 6.0 Nm (对应 g_gravity_mgl=6963 mNm ≈ 7 N·m)
+     *   肘: 保守 1.5 Nm (对应 g_gravity_mgl=1638 mNm ≈ 1.6 N·m) */
+    if (type == JOINT_TYPE_LEG_HIP) {
+        p->mgl        = 0.0f;
+    } else if (type == JOINT_TYPE_ARM_SHOULDER) {
+        p->mgl        = 6.0f;
+    } else {
+        p->mgl        = 1.5f;
+    }
+    p->theta0_rad     = 0.0f;
+
+    /* §E 重力力矩臂向量: 默认全 0 → 退化为位置依赖 mgl*cos(q) (待出厂标定步骤4 烧录) */
+    p->grav_arm[0]    = 0.0f;
+    p->grav_arm[1]    = 0.0f;
+    p->grav_arm[2]    = 0.0f;
+
+    /* §D 导纳/阻抗基值 (被 global_adm_scale 实时缩放)
+     *   M=0.02, B=0.5, K=2.0: 40Nm 关节保守值, 自然频率 ~1.6Hz, 阻尼比 ~1.25 (过阻尼稳) */
+    p->adm_M_base     = 0.02f;
+    p->adm_B_base     = 0.5f;
+    p->adm_K_base     = 2.0f;
+
+    /* 无激励检测阈值 */
+    p->thr_vel_noexc  = 1e-3f;         /* 1 mrad/s ≈ 0.057 °/s */
+    p->thr_tau_noexc  = 0.05f;         /* 50 mNm */
+    p->thr_res_noexc  = 0.1f;          /* 100 mNm */
+}
+
+/* ===== 关节配置表 (唯一身份/硬件映射来源) =====
+ * idx: 0=L-Hip 1=R-Hip 2=L-Shldr 3=L-Elbow 4=R-Shldr 5=R-Elbow
+ *   腿: CAN1 / CyberGear / EN_LEG_L,R
+ *   臂: CAN2 / RS01     / EN_ARM_1~4
+ * 软限位: 腿用步态目标钳位范围; 肩/肘沿用 safety.h 定义 */
+const JointUnit_t g_joint[JOINT_COUNT] = {
+    { JOINT_BUS_CAN1, MOTOR_LEG_0_ID,     JOINT_TYPE_LEG_HIP,      "L-Hip",
+      EN_LEG_L_PORT, EN_LEG_L_PIN, CONTROL_PERIOD_LEG,
+      LOCAL_HIP_POS_MIN_MDEG, LOCAL_HIP_POS_MAX_MDEG,
+      &g_leg_status[0], &g_abo_state[0], &g_abo_assist_torque[0],
+      &g_joint_state[0] },
+
+    { JOINT_BUS_CAN1, MOTOR_LEG_1_ID,     JOINT_TYPE_LEG_HIP,      "R-Hip",
+      EN_LEG_R_PORT, EN_LEG_R_PIN, CONTROL_PERIOD_LEG,
+      LOCAL_HIP_POS_MIN_MDEG, LOCAL_HIP_POS_MAX_MDEG,
+      &g_leg_status[1], &g_abo_state[1], &g_abo_assist_torque[1],
+      &g_joint_state[1] },
+
+    { JOINT_BUS_CAN2, MOTOR_ARM_0_ID,     JOINT_TYPE_ARM_SHOULDER, "L-Shldr",
+      EN_ARM_1_PORT, EN_ARM_1_PIN, CONTROL_PERIOD_ARM,
+      ARM_SHOULDER_POS_MIN, ARM_SHOULDER_POS_MAX,
+      &g_arm_status[0], &g_abo_state[2], &g_abo_assist_torque[2],
+      &g_joint_state[2] },
+
+    { JOINT_BUS_CAN2, MOTOR_ARM_0_ID + 1, JOINT_TYPE_ARM_ELBOW,    "L-Elbow",
+      EN_ARM_2_PORT, EN_ARM_2_PIN, CONTROL_PERIOD_ARM,
+      ARM_ELBOW_POS_MIN, ARM_ELBOW_POS_MAX,
+      &g_arm_status[1], &g_abo_state[3], &g_abo_assist_torque[3],
+      &g_joint_state[3] },
+
+    { JOINT_BUS_CAN2, MOTOR_ARM_0_ID + 2, JOINT_TYPE_ARM_SHOULDER, "R-Shldr",
+      EN_ARM_3_PORT, EN_ARM_3_PIN, CONTROL_PERIOD_ARM,
+      ARM_SHOULDER_POS_MIN, ARM_SHOULDER_POS_MAX,
+      &g_arm_status[2], &g_abo_state[4], &g_abo_assist_torque[4],
+      &g_joint_state[4] },
+
+    { JOINT_BUS_CAN2, MOTOR_ARM_0_ID + 3, JOINT_TYPE_ARM_ELBOW,    "R-Elbow",
+      EN_ARM_4_PORT, EN_ARM_4_PIN, CONTROL_PERIOD_ARM,
+      ARM_ELBOW_POS_MIN, ARM_ELBOW_POS_MAX,
+      &g_arm_status[3], &g_abo_state[5], &g_abo_assist_torque[5],
+      &g_joint_state[5] },
+};
+
+/* ===== 辅助: 钳位 ===== */
+static inline float clampf_local(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* ===== 温度表线性插值 =====
+ * temp_c / TEMP_TABLE_STEP_C = 整数 index, frac = 小数部分
+ * table[-20°C] at index 0, table[80°C] at index 20 */
+static float temp_table_linterp(const float table[TEMP_TABLE_SIZE], float temp_c)
+{
+    float fidx = (temp_c - (float)TEMP_TABLE_MIN_C) / (float)TEMP_TABLE_STEP_C;
+    if (fidx <= 0.0f) return table[0];
+    if (fidx >= (float)(TEMP_TABLE_SIZE - 1)) return table[TEMP_TABLE_SIZE - 1];
+    int i = (int)fidx;
+    float frac = fidx - (float)i;
+    return table[i] + frac * (table[i + 1] - table[i]);
+}
+
+/* ===== §A  力矩零漂补偿 (1kHz) =====
+ * 输入: 原始 torque_raw (Nm, 电机反馈), motor_temp_c (°C, RobStride 上报),
+ *       vel_rad_s (编码器速度, rad/s), saturation (0~1 估算电流环饱和度)
+ * 输出: 去零漂后的 tau_clean (Nm) → 写入 st->tau_meas_nm */
+static void TorqueDrift_Update1kHz(JointUnitState_t *st,
+                                   float torque_raw_nm,
+                                   float motor_temp_c,
+                                   float vel_rad_s,
+                                   float saturation)
+{
+    TorqueDriftComp_t *dc = &st->drift;
+
+    /* 1. 温度补偿查表 (出厂表) */
+    dc->current_zero_thermal = temp_table_linterp(dc->temp_coeff, motor_temp_c);
+
+    /* 2. 零负载窗口检测
+     *   |tau - thermal_zero| < 阈值
+     *   且 |vel|                < 阈值
+     *   且 饱和度 低 (避免闭环积分残留力矩误判零负载) */
+    float tau_thermal_corr = torque_raw_nm - dc->current_zero_thermal;
+    uint8_t likely_zero_load =
+        (fabsf(tau_thermal_corr) < dc->thr_tau_zero_load) &&
+        (fabsf(vel_rad_s)          < dc->thr_vel_zero_load) &&
+        (saturation                < 0.1f);
+
+    if (likely_zero_load) {
+        /* 指数滑动平均, alpha=0.001 → 时间常数 ~1s 等效 1kHz */
+        dc->current_zero_est = 0.999f * dc->current_zero_est + 0.001f * torque_raw_nm;
+        if (dc->zero_load_window_cnt < 0xFFFFu) dc->zero_load_window_cnt++;
+        /* 5s 连续确认 => 可信 */
+        if (dc->zero_load_window_cnt > 5000u) dc->zero_calib_valid = 1u;
+    } else {
+        dc->zero_load_window_cnt = 0;
+    }
+
+    /* 3. 输出去零漂力矩
+     *   零载标定可信 → 用 zero_est; 否则退回到出厂温度表 */
+    float zero = dc->zero_calib_valid ? dc->current_zero_est : dc->current_zero_thermal;
+    st->tau_meas_nm = torque_raw_nm - zero;
+}
+
+/* ===== §E  重力补偿 (基座系向量投影) =====
+ * 输入: g_base[3] = global_pose.gravity_base (归一化, 直立=[0,0,-1])
+ *   - grav_arm 已标定 (范数>ε): tau_g = grav_arm · g_base * 9.81 (Nm)
+ *   - grav_arm 未标定 (默认 0): 退化为位置依赖形式
+ *       tau_g = mgl * (-gz*cos(q) + gx*sin(q)), q = pos + θ0
+ *       直立 gz=-1 → mgl*cos(q), 与旧代码完全一致 (行为不变) */
+static float Gravity_Comp_Vector(const JointUnitState_t *st, const float g_base[3])
+{
+    const JointUnitParams_t *p = &st->params;
+    float ga_norm = sqrtf(p->grav_arm[0]*p->grav_arm[0] +
+                          p->grav_arm[1]*p->grav_arm[1] +
+                          p->grav_arm[2]*p->grav_arm[2]);
+    if (ga_norm > 1e-5f) {
+        /* 已标定: 向量投影 (grav_arm 单位 Nm/g, ×9.81 → Nm) */
+        return (p->grav_arm[0]*g_base[0] +
+                p->grav_arm[1]*g_base[1] +
+                p->grav_arm[2]*g_base[2]) * 9.81f;
+    }
+    /* 未标定: 位置依赖 + g_base 修正 (直立退化为旧 mgl*cos) */
+    float q = st->pos_rad + p->theta0_rad;
+    return p->mgl * (-g_base[2]*cosf(q) + g_base[0]*sinf(q));
+}
+
+/* ===== §B  模型前馈 (已知动力学剥离) ===== */
+static float tau_model_forward(JointUnitState_t *st, float acc_rad_s2)
+{
+    const JointUnitParams_t *p = &st->params;
+
+    /* 摩擦: B*vel + C*sgn(vel)
+     * sgn(0)=0 避免低速抖动. 摩擦参数需要逐关节标定. */
+    float vel = st->vel_rad_s;
+    float fric = p->friction_viscous * vel;
+    if (vel > 1e-4f)       fric += p->friction_coulomb;
+    else if (vel < -1e-4f) fric -= p->friction_coulomb;
+
+    /* §E 重力前馈: 基座系向量投影 (有 gravity_base_ptr) / 直立退化 (无) */
+    float grav;
+    if (st->gravity_base_ptr) {
+        grav = Gravity_Comp_Vector(st, st->gravity_base_ptr);
+    } else {
+        grav = p->mgl * cosf(st->pos_rad + p->theta0_rad);   /* 兜底: 直立假设 */
+    }
+
+    /* 惯量项: J*acc */
+    float inertia = p->J_rotor * acc_rad_s2;
+
+    /* 全局 payload 前馈 (§C 全局协调器 100Hz 下发) */
+    float payload = st->eso3.payload_est;
+
+    return inertia + fric + grav + payload;
+}
+
+/* ===== §D  导纳/阻抗控制器 (1kHz) =====
+ * M*ddx + B*dx + K*x = tau_human  → 解出 adm_pos/adm_vel/tau_cmd
+ * M/B/K 被 global_adm_scale (§D 100Hz 下发) 实时缩放 */
+static void Admittance_Update1kHz(JointUnitState_t *st, float dt_s)
+{
+    const JointUnitParams_t *p = &st->params;
+    float s = st->global_adm_scale;
+    if (s < 0.05f) s = 0.05f;   /* 钳位下限, 避免退化除零 */
+
+    float M = p->adm_M_base * s;
+    float B = p->adm_B_base * s;
+    float K = p->adm_K_base * s;
+
+    /* 半隐式欧拉: 先更新速度再更新位置 (稳定性优于显式) */
+    float tau_h = st->tau_human_nm;
+    st->adm_vel += (tau_h - B * st->adm_vel - K * st->adm_pos) / M * dt_s;
+    st->adm_pos += st->adm_vel * dt_s;
+
+    /* 目标力矩 = 阻抗律输出 (K*x + B*dx) */
+    st->tau_cmd_nm = K * st->adm_pos + B * st->adm_vel;
+}
+
+/* ===== §B  3 阶 ESO 抗漂移 (1kHz) ===== */
+static void JointUnit_ESO3_Update1kHz(JointUnitState_t *st, float tau_cmd_nm, float dt_s)
+{
+    ESO3State_t *es = &st->eso3;
+    const JointUnitParams_t *p = &st->params;
+
+    /* 1. 加速度微分 (速度差分, 1kHz 下噪声可接受) */
+    float acc = (st->vel_rad_s - es->vel_prev) / dt_s;
+    es->vel_prev = st->vel_rad_s;
+
+    /* 2. 精确模型前馈 (剥离已知动力学) */
+    float tau_model = tau_model_forward(st, acc);
+    es->tau_model_prev = tau_model;
+
+    /* 3. ESO 仅观测未建模残差 */
+    float tau_residual = st->tau_meas_nm - tau_model;
+
+    /* 4. 标准 3 阶 ESO 欧拉离散化
+     *   ė = C z - y
+     *   ż₁ = z₂ - β₁ e
+     *   ż₂ = z₃ + Kτ u - β₂ e     (Kτ = kt/J)
+     *   ż₃ = -β₃_adapt e
+     * 注释: "人力估计" tau_human 直接取 z3 (残差域的总扰动) */
+    float e = es->z1 - st->pos_rad;
+    float b0 = p->torque_const / p->J_rotor;   /* 输入增益 = kt / J */
+
+    es->z1 += dt_s * (es->z2 - p->eso_beta[0] * e);
+    es->z2 += dt_s * (es->z3 + b0 * tau_cmd_nm - p->eso_beta[1] * e);
+
+    /* 5. 自适应 β3
+     *   corr = z3 * (τ_res - z3)
+     *   同号 → z3 与残差变化同向, 收敛 / 跟踪需要 → beta3 增大
+     *   异号 → z3 可能积分漂移 → beta3 减小, 抑制风车
+     *   用 tanh 软化, 增益 0.5~1.5 × 基值 beta3_base */
+    float residual_change = tau_residual - es->z3;
+    float correlation = es->z3 * residual_change;
+    float beta3_base = p->eso_beta[2];
+    float beta3_adapt = beta3_base * (1.0f + 0.5f * tanhf(correlation * 10.0f));
+    beta3_adapt = clampf_local(beta3_adapt, 0.1f * beta3_base, 5.0f * beta3_base);
+
+    /* 5b. §C-boost: 负载突变 (抓取/放下) 时
+     *   - beta3 × 3 (快速跟踪新负载下的扰动)
+     *   - z3 向 0 衰减 (遗忘旧负载下的扰动估计)
+     *   - 旁路无激励冻结 (突变期需要持续积分收敛) */
+    uint8_t boost_active = st->eso_boost_mode && (st->eso_boost_timer > 0u);
+    if (boost_active) {
+        beta3_adapt *= 3.0f;
+        /* 遗忘因子: 每拍把 z3 拉向 0 约 5% (时间常数 ~20ms @1kHz) */
+        es->z3 *= 0.95f;
+    }
+
+    /* 6. 无激励检测 → 冻结 z3 积分
+     *   无激励时 z3 积分噪声累积是漂移主因之一. beta3=0 等价于冻结.
+     *   boost 期间旁路冻结 (突变期需要持续收敛). */
+    uint8_t no_excitation =
+        (fabsf(st->vel_rad_s)   < p->thr_vel_noexc) &&
+        (fabsf(tau_cmd_nm)      < p->thr_tau_noexc) &&
+        (fabsf(residual_change) < p->thr_res_noexc);
+
+    if (!no_excitation || boost_active) {
+        es->z3 += dt_s * (-beta3_adapt * e);
+    } /* else 冻结 z3 (等价 beta3=0) */
+
+    /* 7. 发散监测 (|z3| 超过合理范围), 置位标志位供上层故障状态机使用 */
+    if (fabsf(es->z3) > 60.0f) {  /* RobStride 01 40Nm, 允许 60 Nm 异常余量 */
+        st->eso_div_flag = 1u;
+    } else if (st->eso_div_flag && fabsf(es->z3) < 30.0f) {
+        /* 恢复滞后: 回落到 30 Nm 以下清标志 */
+        st->eso_div_flag = 0u;
+    }
+
+    /* 8. 输出人力估计 (仅含 人力 + 真正未建模扰动) */
+    st->tau_human_nm = es->z3;
+}
+
+/* ===== 公共 API: 1kHz 完整漂移免疫更新 ===== */
+#if DRIFT_IMMUNE_ENABLE
+void joint_drift_immune_update1kHz(uint8_t idx, float dt_s)
+{
+    const JointUnit_t *j = joint_get(idx);
+    if (!j || !j->state) return;
+    JointUnitState_t *st = j->state;
+    JointStatus_t  *fb = j->status;
+
+    /* 单位转换 (mdeg → rad, mNm → Nm; 温度 0.1°C → °C) */
+    st->pos_rad   = (float)fb->position * MDEG_TO_RAD_F;
+    st->vel_rad_s = (float)fb->velocity * MDEG_TO_RAD_F;
+    float tau_raw = (float)fb->torque   * MNM_TO_NM_F;
+    float temp_c  = (float)((int16_t)fb->temperature) * 0.1f;
+
+    /* §A  力矩零漂补偿 */
+    TorqueDrift_Update1kHz(st, tau_raw, temp_c, st->vel_rad_s, 0.0f /*saturation 估算占位*/);
+
+    /* §B  ESO3 + §D 导纳 仅在启用时运行 (默认关, 保 legacy ABO 兼容)
+     * eso_enable 在 joint_unit_init 后可由上位机/配置包开启.
+     * 数据流: §A tau_meas → §B ESO3 tau_human → §D 导纳 tau_cmd → 反喂 ESO3 u */
+    if (st->eso_enable) {
+        /* 1. ESO3 更新 (产出 tau_human_nm) */
+        JointUnit_ESO3_Update1kHz(st, st->tau_cmd_nm, dt_s);
+        /* 2. §D 导纳: 用 tau_human 解算 adm_pos/adm_vel/tau_cmd (被 global_adm_scale 缩放) */
+        Admittance_Update1kHz(st, dt_s);
+        /* 3. 下一拍 ESO3 的 u 项用新 tau_cmd (本拍已写入 st->tau_cmd_nm) */
+    }
+}
+
+void joint_set_payload_est(uint8_t idx, float payload_torque_nm)
+{
+    JointUnitState_t *st = joint_runtime_ptr(idx);
+    if (!st) return;
+    st->eso3.payload_est = payload_torque_nm;
+}
+
+void joint_trigger_eso_boost(uint8_t idx, uint16_t duration_ms)
+{
+    JointUnitState_t *st = joint_runtime_ptr(idx);
+    if (!st) return;
+    st->eso_boost_mode = 1u;
+    /* 取较大值: 已在 boost 时不缩短剩余时间 */
+    if (duration_ms > st->eso_boost_timer) st->eso_boost_timer = duration_ms;
+}
+
+void joint_eso_boost_tick_1kHz(void)
+{
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        JointUnitState_t *st = &g_joint_state[i];
+        if (st->eso_boost_timer > 0u) {
+            st->eso_boost_timer--;
+            if (st->eso_boost_timer == 0u) st->eso_boost_mode = 0u;
+        }
+    }
+}
+
+void joint_bind_gravity_vector(uint8_t idx, const float *g_base_ptr)
+{
+    JointUnitState_t *st = joint_runtime_ptr(idx);
+    if (!st) return;
+    st->gravity_base_ptr = g_base_ptr;   /* 上电一次绑定, 1kHz 只读 */
+}
+
+float joint_get_human_torque_nm(uint8_t idx)
+{
+    JointUnitState_t *st = joint_runtime_ptr(idx);
+    if (!st) return 0.0f;
+    return st->tau_human_nm;
+}
+#endif /* DRIFT_IMMUNE_ENABLE */
+
+/* ===== 初始化 ===== */
+void joint_unit_init(void)
+{
+    /* 1. 初始化每个关节的漂移参数 + 默认物理参数 */
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        JointUnitState_t *st = &g_joint_state[i];
+        memset(st, 0, sizeof(*st));
+        const JointUnit_t *j = &g_joint[i];
+
+        /* §A 温度系数拷贝出厂默认 + 阈值配置 */
+        memcpy(st->drift.temp_coeff, g_default_temp_coeff, sizeof(g_default_temp_coeff));
+        switch (j->type) {
+        case JOINT_TYPE_LEG_HIP:
+            /* 髋关节负载大, 阈值放宽 */
+            st->drift.thr_tau_zero_load = 0.10f;   /* 100 mNm */
+            st->drift.thr_vel_zero_load = 0.02f;   /* ~1.15 °/s */
+            break;
+        case JOINT_TYPE_ARM_SHOULDER:
+        case JOINT_TYPE_ARM_ELBOW:
+        default:
+            st->drift.thr_tau_zero_load = 0.05f;   /* 50 mNm */
+            st->drift.thr_vel_zero_load = 0.01f;   /* ~0.57 °/s */
+            break;
+        }
+
+        /* §B 默认物理参数 (由关节类型决定) */
+        joint_params_set_default(&st->params, j->type);
+
+        /* 默认: ESO3 关闭, 系统继续走 legacy ABO (向后兼容)
+         * 可在 runtime 由用户/配置包置 1 启用 ESO3 路径. */
+        st->eso_enable = 0u;
+    }
+
+    /* 2. 启动摘要打印 (零 IMU 漂移包摘要) */
+    printf("[JOINT] %u joints registered:", (unsigned)JOINT_COUNT);
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        printf(" [%u]%s(b%d,id0x%02lX,ESO=%u)", (unsigned)i, g_joint[i].name,
+               (unsigned)g_joint[i].bus, (unsigned long)g_joint[i].motor_id,
+               (unsigned)g_joint_state[i].eso_enable);
+    }
+    printf("\r\n");
+#if DRIFT_IMMUNE_ENABLE
+    printf("[DRIFT] Immune package ON: §A torque zero-drift + §B ESO3 adaptive beta3\r\n");
+#else
+    printf("[DRIFT] Immune package OFF (DRIFT_IMMUNE_ENABLE=0)\r\n");
+#endif
+}
+
+/* ===== 基础访问器实现 ===== */
+const JointUnit_t *joint_get(uint8_t idx)
+{
+    if (idx >= JOINT_COUNT) return NULL;
+    return &g_joint[idx];
+}
+
+uint8_t joint_count(void)
+{
+    return JOINT_COUNT;
+}
+
+JointStatus_t *joint_status_ptr(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? j->status : NULL;
+}
+
+ABOState_t *joint_abo_ptr(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? j->abo : NULL;
+}
+
+int32_t *joint_assist_ptr(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? j->assist_torque : NULL;
+}
+
+JointUnitState_t *joint_runtime_ptr(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? j->state : NULL;
+}
+
+CAN_HandleTypeDef *joint_bus_handle(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    if (!j) return NULL;
+    return (j->bus == JOINT_BUS_CAN1) ? &hcan1 : &hcan2;
+}
+
+JointType_e joint_type(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? j->type : JOINT_TYPE_LEG_HIP;
+}
+
+uint8_t joint_is_leg(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? (j->type == JOINT_TYPE_LEG_HIP) : 0;
+}
+
+uint8_t joint_is_arm(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    return j ? (j->type != JOINT_TYPE_LEG_HIP) : 0;
+}
+
+uint8_t joint_idx_from_motor_id(uint32_t motor_id)
+{
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        if (g_joint[i].motor_id == motor_id) return i;
+    }
+    return 0xFF;
+}
+
+void joint_push_tx(uint8_t idx, int32_t target, uint8_t mode)
+{
+    const JointUnit_t *j = joint_get(idx);
+    if (!j) return;
+    CanTxEntry_t e;
+    e.bus       = (uint8_t)j->bus;
+    e.motor_id  = (uint8_t)j->motor_id;
+    e.target    = target;
+    e.mode      = mode;
+    can_tx_fifo_write(&e);
+}
+
+void joint_disable_hw(uint8_t idx)
+{
+    const JointUnit_t *j = joint_get(idx);
+    if (!j) return;
+    HAL_GPIO_WritePin(j->en_port, j->en_pin, GPIO_PIN_RESET);
+}
+
+======== 章节名: §C 全局协调器 — 逆动力学负载估计 (100Hz) ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\global_coordinator.h
+/**
+ * @file global_coordinator.h
+ * @brief 全局协调单例 — 顶层协同 (架构评审 §C + 未来 AO/相位)
+ *
+ * 硬约束: 单芯片、无 IMU、无外挂 MCU。
+ *
+ * 现已落地:
+ *   §C  Global_LoadEstimator_Update100Hz
+ *        全身运动学 + 多关节力矩耦合解算「末端外力/负载」
+ *        下发 payload_torque 给每关节 → §B ESO3 模型前馈剥离
+ *
+ * 未来占位:
+ *   §D  关节空间相位变量 + 任务状态机双轨制 (解决 AO 相位漂移)
+ *   §E  ZUPT + 足底力矩接触检测 + 闭链约束 (基座里程计漂移免疫)
+ */
+#ifndef __GLOBAL_COORDINATOR_H__
+#define __GLOBAL_COORDINATOR_H__
+
+#include "joint_unit.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ===== 末端外力 (3 维平面近似, 工业工况低速) =====
+ * 单位: N (力), N·m (力矩). 目前左臂/右臂单独估计, 下肢独立估计重力偏置. */
+typedef struct {
+    float fx;           /* x 向力 (N) */
+    float fy;           /* y 向力 (N) */
+    float m_ext;        /* 末端外力矩 (N·m), 通常 0 (手抓自由抓握) */
+} EndEffectorForce_t;
+
+/* ===== 全局协调器状态 =====
+ * 顶层单例; 不与 wire-format 协议耦合. */
+typedef struct {
+    EndEffectorForce_t f_ext_arm[2];   /* 0=左臂, 1=右臂 */
+    float              joint_payload_torque[JOINT_COUNT];  /* 对每关节的 payload 扭矩 (Nm)
+                                                            * 最终下发给 JointUnit payload_est */
+
+    /* 突变检测 (抓取/放下 识别) */
+    float              f_prev_norm[2];      /* 上一拍 |F| */
+    uint8_t            payload_change_flag; /* 1=检测到突变, 0=稳定 */
+    uint16_t           payload_change_cnt;  /* 去抖计数 */
+    uint16_t           load_change_timer;   /* §C 突变持续窗口 (100Hz 递减), 0=稳定 */
+
+    /* 工业工况识别: 站立/搬运/行走/蹲起 */
+    uint8_t            op_mode;             /* 0=未知, 1=站立, 2=搬运, 3=行走, 4=蹲起 */
+} GlobalCoordinator_t;
+
+extern GlobalCoordinator_t g_global_coord;
+
+/* ===== API ===== */
+void global_coordinator_init(void);
+
+/* §C  主循环 100Hz 调用 (与 industrial_load_estimator 同时钟域)
+ * 输入: 6 关节反馈 (位置 + 去零漂后的力矩)
+ * 副作用: 写入 g_global_coord.joint_payload_torque[]
+ *          调用 joint_set_payload_est(i, tau_payload[i]) 下发给分布式关节 */
+void Global_LoadEstimator_Update100Hz(void);
+
+/* 只读访问: 获取末端外力估计 (调试/上传) */
+const EndEffectorForce_t *global_get_arm_force(uint8_t side);  /* side 0=L, 1=R */
+float                    global_get_payload_torque(uint8_t joint_idx);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __GLOBAL_COORDINATOR_H__ */
+
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\global_coordinator.c
+/**
+ * @file global_coordinator.c
+ * @brief 全局协调单例实现 — 顶层协同
+ *
+ * §C  Global_LoadEstimator_Update100Hz
+ *   输入:   6 关节的反馈 (q, tau_meas_clean)
+ *   模型:   工业搬运准静态 (acc≈0, vel≈0)
+ *           tau_meas - G(q) = J(q)^T · F_ext
+ *   解算:   F_ext = (J^T)^+ · (tau_meas - G(q))   (2x1 伪逆 / 闭式 2-DOF)
+ *   输出:   per-joint payload_tau = J^T_col(i) · F_ext
+ *           → 调用 joint_set_payload_est(i, ...) 下发
+ *
+ * 简化与约束:
+ *   - 无 IMU 无额外传感器. 纯编码器绝对角度 + 电流力矩.
+ *   - 双臂独立 (各 2-DOF, 肩+肘 平面). 腿不参与外力估计, 重力偏置保留 ABO 吸收.
+ *   - 闭式雅可比 + 伪逆, 100Hz, 轻量浮点, H7/RT1062/F407(FPU) 均能跑.
+ *   - 若模型不准: ESO3 自适应 beta3 + 残差吸收兜底, 不爆炸.
+ */
+#include "global_coordinator.h"
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+
+/* ===== 常量 ===== */
+#define MDEG_TO_RAD_GC     (1.7453292519943295e-05f)
+#define MNM_TO_NM_GC       (0.001f)
+#define NM_TO_MNM_GC       (1000.0f)
+
+/* 机械臂尺寸参考 (保守估计, 现场标定后应覆盖)
+ * L1: 上臂 ~ 0.30 m, L2: 前臂 ~ 0.30 m — 未用时作为 2D 平面参数 */
+#define ARM_L1_M            0.30f
+#define ARM_L2_M            0.30f
+
+/* 负载突变检测: |ΔF| > 阈值 (牛顿)
+ * 20kg 工件 ~ 200 N, 50N 是合理的抓取/放下判别下限 */
+#define PAYLOAD_DELTA_F_N   50.0f
+#define PAYLOAD_DEBOUNCE_MS 5      /* 100Hz × 5 = 50 ms 去抖 */
+
+GlobalCoordinator_t g_global_coord;
+
+/* ===== 辅助 ===== */
+static inline float gc_clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* ===== 单臂 2-DOF 重力模型 (准静态) =====
+ * side: 0=左臂 (idx 2=肩, idx 3=肘)
+ *       1=右臂 (idx 4=肩, idx 5=肘)
+ * 输出: G_tau[0]=肩关节重力扭矩 (Nm), G_tau[1]=肘
+ *
+ * 参数化: 肩 MGL1, 肘 MGL2 — 来自 JointUnitState.params.mgl
+ *         theta0 由每关节 zero-cal 覆盖 */
+static void arm_gravity_model(uint8_t side, float G_tau[2])
+{
+    uint8_t j_shld = (side == 0) ? 2u : 4u;
+    uint8_t j_elbw = j_shld + 1u;
+    JointUnitState_t *st_s = joint_runtime_ptr(j_shld);
+    JointUnitState_t *st_e = joint_runtime_ptr(j_elbw);
+    if (!st_s || !st_e) { G_tau[0] = G_tau[1] = 0.0f; return; }
+
+    float q_s = st_s->pos_rad + st_s->params.theta0_rad;  /* 肩绝对角 (rad) */
+    float q_e = st_e->pos_rad + st_e->params.theta0_rad;  /* 肘绝对角 (rad) */
+    float mgl_s = st_s->params.mgl;
+    float mgl_e = st_e->params.mgl;
+
+    /* 肩: 同时扛上臂 + 前臂重量投影
+     *   G_s = mgl1*cos(q_s) + mgl2*cos(q_s + q_e)
+     * 肘: 仅前臂
+     *   G_e = mgl2*cos(q_s + q_e) */
+    G_tau[0] = mgl_s * cosf(q_s) + mgl_e * cosf(q_s + q_e);
+    G_tau[1] = mgl_e * cosf(q_s + q_e);
+}
+
+/* ===== 单臂 2-DOF 雅可比转置 J^T (平面, 末端力→关节力矩) =====
+ * τ = J^T · [fx, fy]^T
+ *   J^T = [  -L1·sq - L2·sqe   -L2·sqe ]   ← τ_s
+ *         [   L1·cq + L2·cqe    L2·cqe ]   ← τ_e
+ *         (注意: 不同 DH 定义符号有差异, 这里用常见的 q1=肩绝对角, q2=肘相对角)
+ * 本处按「肘 q_e 为相对肩夹角」处理. 若当前 RS01 报告的是绝对角,
+ * J 中 q_e 项需改为「绝对-肩」差; 先用保守近似: 肘相对 = pos_elb - pos_shld. */
+static void arm_jacobian_T(uint8_t side, float q1_rad, float q2_rel_rad, float JT[2][2])
+{
+    (void)side;
+    float sq  = sinf(q1_rad);
+    float cq  = cosf(q1_rad);
+    float sqe = sinf(q1_rad + q2_rel_rad);
+    float cqe = cosf(q1_rad + q2_rel_rad);
+
+    /* row 0: shoulder joint */
+    JT[0][0] = -ARM_L1_M * sq  - ARM_L2_M * sqe;
+    JT[0][1] =  ARM_L1_M * cq  + ARM_L2_M * cqe;
+    /* row 1: elbow joint */
+    JT[1][0] = -ARM_L2_M * sqe;
+    JT[1][1] =  ARM_L2_M * cqe;
+}
+
+/* ===== (J^T)^+ 伪逆 (2x2 方阵可逆 → 真逆) =====
+ * det = JT[0][0]·JT[1][1] - JT[0][1]·JT[1][0]
+ * 如果奇异 (|det| < eps): 退化为对角阻尼近似 1/k·I */
+static void pinv2x2(const float A[2][2], float Ai[2][2])
+{
+    float det = A[0][0]*A[1][1] - A[0][1]*A[1][0];
+    const float eps = 1e-5f;
+    if (fabsf(det) < eps) {
+        /* 奇异: 退化为 对角阻尼伪逆, 避免 0 除 */
+        Ai[0][0] = 1.0f; Ai[0][1] = 0.0f;
+        Ai[1][0] = 0.0f; Ai[1][1] = 1.0f;
+        return;
+    }
+    float inv_det = 1.0f / det;
+    Ai[0][0] =  A[1][1] * inv_det;
+    Ai[0][1] = -A[0][1] * inv_det;
+    Ai[1][0] = -A[1][0] * inv_det;
+    Ai[1][1] =  A[0][0] * inv_det;
+}
+
+/* ===== 单臂完整解算 (2-DOF) =====
+ * side: 0=L, 1=R. 填充 f_ext[side] 和 joint_payload_torque[肩/肘]. */
+static void arm_load_solve(uint8_t side)
+{
+    uint8_t j_shld = (side == 0) ? 2u : 4u;
+    uint8_t j_elbw = j_shld + 1u;
+
+    JointStatus_t *fb_s = joint_status_ptr(j_shld);
+    JointStatus_t *fb_e = joint_status_ptr(j_elbw);
+    JointUnitState_t *st_s = joint_runtime_ptr(j_shld);
+    JointUnitState_t *st_e = joint_runtime_ptr(j_elbw);
+    if (!fb_s || !fb_e || !st_s || !st_e) return;
+
+    /* 1. 关节空间重力模型 G(q) */
+    float G_tau[2];
+    arm_gravity_model(side, G_tau);
+
+    /* 2. 取去零漂后的 tau_meas (来自 §A) */
+    float tau_s = st_s->tau_meas_nm;
+    float tau_e = st_e->tau_meas_nm;
+
+    /* 3. tau_meas - G(q) → 外力产生的等效扭矩 τ_ext */
+    float tau_ext[2];
+    tau_ext[0] = tau_s - G_tau[0];
+    tau_ext[1] = tau_e - G_tau[1];
+
+    /* 4. 读取关节角 → 计算 J^T → 求 (J^T)^+ → 解 F_ext */
+    float q1 = st_s->pos_rad + st_s->params.theta0_rad;
+    float q2 = (st_e->pos_rad + st_e->params.theta0_rad) - q1;   /* 肘相对角 (近似) */
+
+    float JT[2][2];
+    arm_jacobian_T(side, q1, q2, JT);
+
+    float JT_inv[2][2];
+    pinv2x2(JT, JT_inv);
+
+    EndEffectorForce_t *f = &g_global_coord.f_ext_arm[side];
+    f->fx    = JT_inv[0][0] * tau_ext[0] + JT_inv[0][1] * tau_ext[1];
+    f->fy    = JT_inv[1][0] * tau_ext[0] + JT_inv[1][1] * tau_ext[1];
+    f->m_ext = 0.0f;
+
+    /* 5. 物理合理钳位: 工业搬运单手末端力 ≤ 300N (约 30kg) */
+    f->fx = gc_clampf(f->fx, -300.0f, 300.0f);
+    f->fy = gc_clampf(f->fy, -300.0f, 300.0f);
+
+    /* 6. 回映射 J^T·F_ext → 各关节 payload 扭矩
+     *   这一步和步骤3 数值上应当 ≈ tau_ext, 但用 F_ext 钳位后重新回算更安全 */
+    float pld_s = JT[0][0]*f->fx + JT[0][1]*f->fy;
+    float pld_e = JT[1][0]*f->fx + JT[1][1]*f->fy;
+
+    /* 7. 写入全局 joint_payload_torque[], 同时下发给单关节实例 */
+    g_global_coord.joint_payload_torque[j_shld] = pld_s;
+    g_global_coord.joint_payload_torque[j_elbw] = pld_e;
+    joint_set_payload_est(j_shld, pld_s);
+    joint_set_payload_est(j_elbw, pld_e);
+
+    /* 8. 负载突变检测 (抓取/放下) → 触发 §C-boost */
+    float fnorm = sqrtf(f->fx * f->fx + f->fy * f->fy);
+    float dfn   = fabsf(fnorm - g_global_coord.f_prev_norm[side]);
+    g_global_coord.f_prev_norm[side] = fnorm;
+    if (dfn > PAYLOAD_DELTA_F_N) {
+        g_global_coord.payload_change_cnt++;
+        if (g_global_coord.payload_change_cnt >= PAYLOAD_DEBOUNCE_MS) {
+            g_global_coord.payload_change_flag = 1u;
+            g_global_coord.load_change_timer  = 500u;  /* 500 ms (100Hz × 5) */
+            /* §C-boost: 触发所有关节 ESO 快速收敛 (β3×3 + 遗忘旧 z3)
+             *   持续 300ms, 1kHz 递减; 抓取/放下后负载阶跃, 旧 z3 失效需重收敛 */
+            for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+                joint_trigger_eso_boost(i, 300u);
+            }
+        }
+    }
+}
+
+/* ===== 腿部负载近似 (准静态, 由 ABO 偏置主承担) =====
+ * 工业场景, 搬运时双腿主要抗地面反力. 我们用「双侧 tau_meas 与重力偏置之差」
+ * 近似作 payload estimate, 避免雅可比; 若不准 ESO3 自适应兜底.
+ *   payload ≈ (tau_meas - bias_est) / G_ratio
+ * 保守近似: 直接写入 payload_est 的 20% 前馈, 不强行剥离全部. */
+static void leg_payload_approx(void)
+{
+    for (uint8_t i = 0; i < 2; i++) {
+        ABOState_t     *abo = joint_abo_ptr(i);
+        JointUnitState_t *st = joint_runtime_ptr(i);
+        if (!abo || !st) continue;
+
+        float tau_meas_nm = st->tau_meas_nm;
+        float bias_nm     = (float)abo->bias_est * MNM_TO_NM_GC;
+        float payload     = 0.2f * (tau_meas_nm - bias_nm);   /* 仅轻量剥离, 保守 */
+
+        payload = gc_clampf(payload, -40.0f, 40.0f);  /* 髋单关节 ≤ 40 N·m */
+        g_global_coord.joint_payload_torque[i] = payload;
+        joint_set_payload_est(i, payload);
+    }
+}
+
+/* ===== 工况识别 (粗粒度, 为 §D 相位任务状态机占位) =====
+ * 判据: 双腿速度 < 阈值 → 站立/搬运; 否则行走.
+ * 手臂末端 |F| > 50N → 搬运.
+ * 肩/肘接近 90° 弯 → 蹲起. */
+static void op_mode_detect(void)
+{
+    JointStatus_t *ls = joint_status_ptr(0);
+    JointStatus_t *rs = joint_status_ptr(1);
+    if (!ls || !rs) return;
+
+    float vleg = fabsf((float)ls->velocity) + fabsf((float)rs->velocity);  /* mdeg/s */
+    uint8_t static_leg = (vleg < 5000.0f);  /* < 5°/s 视为静态 */
+
+    float fnorm_L = sqrtf(g_global_coord.f_ext_arm[0].fx*g_global_coord.f_ext_arm[0].fx +
+                          g_global_coord.f_ext_arm[0].fy*g_global_coord.f_ext_arm[0].fy);
+    float fnorm_R = sqrtf(g_global_coord.f_ext_arm[1].fx*g_global_coord.f_ext_arm[1].fx +
+                          g_global_coord.f_ext_arm[1].fy*g_global_coord.f_ext_arm[1].fy);
+    uint8_t carrying = (fnorm_L > 50.0f || fnorm_R > 50.0f);
+
+    if (!static_leg)             g_global_coord.op_mode = 3u;   /* 行走 */
+    else if (carrying)           g_global_coord.op_mode = 2u;   /* 搬运 */
+    else                         g_global_coord.op_mode = 1u;   /* 站立 */
+}
+
+/* ===== §C  顶层入口 100Hz ===== */
+void Global_LoadEstimator_Update100Hz(void)
+{
+#if DRIFT_IMMUNE_ENABLE
+    /* 双臂 (左臂 idx 2,3 / 右臂 idx 4,5) */
+    arm_load_solve(0);
+    arm_load_solve(1);
+
+    /* 腿部近似 */
+    leg_payload_approx();
+
+    /* 工况识别 (占位, §D 会细化) */
+    op_mode_detect();
+
+    /* §C load_change_timer 递减 (100Hz: 每 10ms 减 1, 等效 500ms 超时) */
+    if (g_global_coord.load_change_timer > 0u) {
+        g_global_coord.load_change_timer--;
+        if (g_global_coord.load_change_timer == 0u) {
+            g_global_coord.payload_change_flag = 0u;
+        }
+    }
+#endif /* DRIFT_IMMUNE_ENABLE */
+}
+
+/* ===== 初始化 ===== */
+void global_coordinator_init(void)
+{
+    memset(&g_global_coord, 0, sizeof(g_global_coord));
+    g_global_coord.op_mode = 0u;
+#if DRIFT_IMMUNE_ENABLE
+    printf("[GC] Global coordinator ON: §C full-body load estimator (100Hz, no-IMU)\r\n");
+#else
+    printf("[GC] Global coordinator: drift-immune disabled\r\n");
+#endif
+}
+
+const EndEffectorForce_t *global_get_arm_force(uint8_t side)
+{
+    if (side > 1u) return NULL;
+    return &g_global_coord.f_ext_arm[side];
+}
+
+float global_get_payload_torque(uint8_t joint_idx)
+{
+    if (joint_idx >= JOINT_COUNT) return 0.0f;
+    return g_global_coord.joint_payload_torque[joint_idx];
+}
+
+======== 章节名: §D 相位调度器 — 运动学相位+任务状态机 (100Hz) ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\global_phase.h
+/**
+ * @file global_phase.h
+ * @brief §D 相位漂移终结 — 运动学相位变量 + 任务状态机双轨制
+ *
+ * 核心思想:
+ *   工业外骨骼 80% 工况非周期 (搬运/装配/蹲起/推拉).
+ *   强行用 AO 锁相位是漂移/对抗主因.
+ *
+ *   行走  → PHASE_GAIT  : AO 锁相 (唯一强周期工况), 输出 φ∈[0,1)
+ *   蹲起  → PHASE_SQUAT : 髋角单调映射 s∈[0,1], 零漂移
+ *   搬运  → PHASE_CARRY : 离散任务状态机 IDLE→GRASP→LIFT→CARRY→RELEASE, 零积分
+ *   自由  → PHASE_FREE  : 纯导纳/阻抗, K/B 固定或按负载调度
+ *
+ * 输出: 每关节 adm_scale (复合 K/B 缩放因子), 下发 JointUnitState.global_adm_scale
+ *       供控制环 (数据流待定) 调度导纳/阻抗.
+ *
+ * 无 IMU: 模式识别仅用关节角度/速度/力矩 + §C 末端外力.
+ */
+#ifndef __GLOBAL_PHASE_H__
+#define __GLOBAL_PHASE_H__
+
+#include "joint_unit.h"
+#include "global_coordinator.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ===== 相位模式 ===== */
+typedef enum {
+    PHASE_GAIT  = 0,   /* 行走/跑步: AO 锁相 */
+    PHASE_SQUAT = 1,   /* 蹲起/负重站立: 髋角单调映射 */
+    PHASE_CARRY = 2,   /* 上肢搬运/推拉: 任务状态机 */
+    PHASE_FREE  = 3,   /* 自由移动/微调: 透明导纳 */
+} PhaseMode_e;
+
+/* ===== 搬运任务子状态机 (PHASE_CARRY 内部) ===== */
+typedef enum {
+    CARRY_IDLE    = 0,   /* 空闲, 末端无力 */
+    CARRY_GRASP   = 1,   /* 抓取过渡: 力矩上升 */
+    CARRY_LIFT    = 2,   /* 提起: 末端力 > 阈值且上抬 */
+    CARRY_CARRY   = 3,   /* 持续搬运: 力稳定 */
+    CARRY_RELEASE = 4,   /* 放下过渡: 力矩下降 */
+} CarrySubState_e;
+
+/* ===== 任务相位结构 ===== */
+typedef struct {
+    PhaseMode_e      mode;                 /* 当前主模式 */
+    CarrySubState_e  carry_sub;             /* PHASE_CARRY 子状态 */
+    float            phase_val;             /* 归一化相位 [0,1], GAIT/SQUAT 用, CARRY/FREE=0 */
+    float            adm_scale[JOINT_COUNT];/* 每关节导纳/阻抗缩放, 下发 JointUnitState */
+
+    /* 模式切换去抖 */
+    PhaseMode_e      mode_candidate;        /* 候选模式 */
+    uint16_t         mode_hold_cnt;         /* 候选持续计数 (100Hz × N) */
+    PhaseMode_e      mode_prev;             /* 上一拍模式 (边沿检测) */
+
+    /* 蹲起相位缓存的髋角上下限 (现场标定覆盖) */
+    float            hip_min_rad;
+    float            hip_max_rad;
+} TaskPhase_t;
+
+extern TaskPhase_t g_task_phase;
+
+/* ===== API ===== */
+void  global_phase_init(void);
+
+/* §D 主入口 100Hz: 模式识别 + 相位/导纳计算 + 下发 adm_scale */
+void  Global_PhaseScheduler_Update100Hz(void);
+
+/* 只读访问 */
+const TaskPhase_t *global_phase_get(void);
+PhaseMode_e        global_phase_mode(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __GLOBAL_PHASE_H__ */
+
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\global_phase.c
+/**
+ * @file global_phase.c
+ * @brief §D 相位漂移终结 — 运动学相位 + 任务状态机
+ *
+ * 模式识别规则树 (无 IMU, 仅编码器/力矩/§C 末端力):
+ *   1. 双腿周期性摆动 (速度交替过零 + 步态运行标志)  → PHASE_GAIT
+ *   2. 双腿同步屈伸 (同向速度 + 髋角大幅变化)         → PHASE_SQUAT
+ *   3. 末端 |F| > 阈值 (§C 已解算)                    → PHASE_CARRY
+ *   4. 否则                                            → PHASE_FREE
+ *
+ * 相位/导纳映射:
+ *   GAIT  : 复用 g_gait_phase, 按相位调度刚度 (站立相高 K, 摆动相低 K)
+ *   SQUAT : s = (hip - hip_min)/(hip_max - hip_min), 蹲底高阻尼/站立高刚度
+ *   CARRY : 按负载质量调度 (重载高阻尼低刚度, 轻载反之)
+ *   FREE  : K=0, B=small (透明)
+ */
+#include "global_phase.h"
+#include "control_isr.h"   /* g_gait_phase, mode_get_gait_running */
+#include "mode_manager.h"
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+
+#define MDEG_TO_RAD_PH   (1.7453292519943295e-05f)
+
+/* 模式切换去抖: 候选需持续 N 拍 (100Hz × N ms) 才切换 */
+#define MODE_HOLD_THRESH     5u     /* 50 ms 去抖, 避免抖动 */
+
+/* 模式识别阈值 */
+#define GAIT_VEL_THRESH_MDEG_S   20000.0f   /* 20°/s 视为腿在动 */
+#define SQUAT_VEL_THRESH_MDEG_S  5000.0f    /* 5°/s 蹲起速度下限 */
+#define SQUAT_RANGE_THRESH_RAD   0.15f      /* 髋角变化 > 8.6° 视为蹲起 */
+#define CARRY_FORCE_THRESH_N     30.0f      /* 末端力 > 30N 视为搬运 */
+
+/* 蹲起髋角默认范围 (现场标定覆盖): 0° ~ 90° */
+#define HIP_MIN_RAD_DEFAULT   0.0f
+#define HIP_MAX_RAD_DEFAULT   1.5707963f
+
+TaskPhase_t g_task_phase;
+
+/* ===== 辅助 ===== */
+static inline float clampf_ph(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+static inline float map_range(float v, float lo, float hi) {
+    if (hi <= lo) return 0.0f;
+    return clampf_ph((v - lo) / (hi - lo), 0.0f, 1.0f);
+}
+
+/* ===== 模式识别 =====
+ * 优先级: GAIT > SQUAT > CARRY > FREE
+ *   (行走时即使手上有负载也按 GAIT 调度腿部, 上肢单独 CARRY) */
+static PhaseMode_e detect_mode(void)
+{
+    JointStatus_t *ls = joint_status_ptr(0);
+    JointStatus_t *rs = joint_status_ptr(1);
+    if (!ls || !rs) return PHASE_FREE;
+
+    float vl = fabsf((float)ls->velocity);   /* mdeg/s */
+    float vr = fabsf((float)rs->velocity);
+    float ql = (float)ls->position * MDEG_TO_RAD_PH;
+    float qr = (float)rs->position * MDEG_TO_RAD_PH;
+
+    /* 1. GAIT: 步态运行标志 + 至少一条腿在动 + 左右腿速度不同步 (交替) */
+    if (mode_get_gait_running() && (vl + vr > GAIT_VEL_THRESH_MDEG_S)) {
+        /* 交替判据: 两腿速度符号相反 (一摆一撑) */
+        float vls = (float)ls->velocity;
+        float vrs = (float)rs->velocity;
+        if ((vls >  SQUAT_VEL_THRESH_MDEG_S && vrs < -SQUAT_VEL_THRESH_MDEG_S) ||
+            (vls < -SQUAT_VEL_THRESH_MDEG_S && vrs >  SQUAT_VEL_THRESH_MDEG_S)) {
+            return PHASE_GAIT;
+        }
+    }
+
+    /* 2. SQUAT: 双腿同向运动 + 髋角变化范围大 */
+    {
+        float vls = (float)ls->velocity;
+        float vrs = (float)rs->velocity;
+        uint8_t same_dir =
+            ((vls >  SQUAT_VEL_THRESH_MDEG_S) && (vrs >  SQUAT_VEL_THRESH_MDEG_S)) ||
+            ((vls < -SQUAT_VEL_THRESH_MDEG_S) && (vrs < -SQUAT_VEL_THRESH_MDEG_S));
+        float q_range = fabsf(qr - ql);
+        /* 髋角本身偏离中位也作为蹲起证据 */
+        uint8_t hip_bent = (fabsf(ql) > SQUAT_RANGE_THRESH_RAD ||
+                            fabsf(qr) > SQUAT_RANGE_THRESH_RAD);
+        if (same_dir && hip_bent) return PHASE_SQUAT;
+    }
+
+    /* 3. CARRY: §C 末端外力超阈值 */
+    {
+        const EndEffectorForce_t *fL = global_get_arm_force(0);
+        const EndEffectorForce_t *fR = global_get_arm_force(1);
+        float fL_n = fL ? sqrtf(fL->fx*fL->fx + fL->fy*fL->fy) : 0.0f;
+        float fR_n = fR ? sqrtf(fR->fx*fR->fx + fR->fy*fR->fy) : 0.0f;
+        if (fL_n > CARRY_FORCE_THRESH_N || fR_n > CARRY_FORCE_THRESH_N) {
+            return PHASE_CARRY;
+        }
+    }
+
+    /* 4. FREE */
+    return PHASE_FREE;
+}
+
+/* ===== 模式切换去抖 ===== */
+static PhaseMode_e mode_switch_debounce(PhaseMode_e detected)
+{
+    TaskPhase_t *tp = &g_task_phase;
+    if (detected == tp->mode_candidate) {
+        if (tp->mode_hold_cnt < 0xFFFFu) tp->mode_hold_cnt++;
+        if (tp->mode_hold_cnt >= MODE_HOLD_THRESH && detected != tp->mode) {
+            tp->mode_prev = tp->mode;
+            tp->mode = detected;
+        }
+    } else {
+        tp->mode_candidate = detected;
+        tp->mode_hold_cnt = 0u;
+    }
+    return tp->mode;
+}
+
+/* ===== 搬运子状态机 (IDLE→GRASP→LIFT→CARRY→RELEASE) ===== */
+static void carry_substate_update(void)
+{
+    TaskPhase_t *tp = &g_task_phase;
+    const EndEffectorForce_t *fL = global_get_arm_force(0);
+    const EndEffectorForce_t *fR = global_get_arm_force(1);
+    float fmax = 0.0f;
+    if (fL) { float n = sqrtf(fL->fx*fL->fx + fL->fy*fL->fy); if (n > fmax) fmax = n; }
+    if (fR) { float n = sqrtf(fR->fx*fR->fx + fR->fy*fR->fy); if (n > fmax) fmax = n; }
+
+    /* 阈值滞回: 进入 LIFT 需 > 40N, 退出到 IDLE 需 < 15N */
+    switch (tp->carry_sub) {
+    case CARRY_IDLE:
+        if (fmax > 25.0f) tp->carry_sub = CARRY_GRASP;
+        break;
+    case CARRY_GRASP:
+        if (fmax > 40.0f)      tp->carry_sub = CARRY_LIFT;
+        else if (fmax < 15.0f) tp->carry_sub = CARRY_IDLE;
+        break;
+    case CARRY_LIFT:
+        tp->carry_sub = CARRY_CARRY;   /* 稳定后直接转持续 */
+        break;
+    case CARRY_CARRY:
+        if (fmax < 30.0f) tp->carry_sub = CARRY_RELEASE;
+        break;
+    case CARRY_RELEASE:
+        if (fmax < 15.0f)      tp->carry_sub = CARRY_IDLE;
+        else if (fmax > 40.0f) tp->carry_sub = CARRY_CARRY;
+        break;
+    default:
+        tp->carry_sub = CARRY_IDLE;
+        break;
+    }
+}
+
+/* ===== 相位→导纳映射 =====
+ * adm_scale: 1.0=默认; <1.0 降刚度/阻尼(透明); >1.0 增阻尼(稳)
+ *   腿 idx 0,1; 肩 idx 2,4; 肘 idx 3,5 */
+static void map_phase_to_admittance(void)
+{
+    TaskPhase_t *tp = &g_task_phase;
+    float s = tp->phase_val;
+
+    switch (tp->mode) {
+    case PHASE_GAIT: {
+        /* s∈[0,1): 0~0.5 站立相 (高刚度 K↑), 0.5~1.0 摆动相 (低刚度 K↓)
+         *   腿: 站立相 adm=1.2 (稳), 摆动相 adm=0.6 (柔)
+         *   臂: 反相摆臂, 跟随腿相位做对称调度 */
+        float leg_scale = (s < 0.5f) ? (1.2f) : (0.6f);
+        float arm_scale = (s < 0.5f) ? (0.7f) : (1.0f);
+        tp->adm_scale[0] = leg_scale;   /* L-Hip */
+        tp->adm_scale[1] = leg_scale;   /* R-Hip */
+        tp->adm_scale[2] = arm_scale;   /* L-Shldr */
+        tp->adm_scale[3] = arm_scale;   /* L-Elbow */
+        tp->adm_scale[4] = arm_scale;   /* R-Shldr */
+        tp->adm_scale[5] = arm_scale;   /* R-Elbow */
+        break;
+    }
+    case PHASE_SQUAT: {
+        /* s=0 站立顶 (高刚度), s=1 蹲底 (高阻尼防跌)
+         *   腿: adm = 1.0 + 0.5*s (蹲底更稳)
+         *   臂: 自由跟随 adm=0.8 */
+        float leg_scale = 1.0f + 0.5f * s;
+        tp->adm_scale[0] = leg_scale;
+        tp->adm_scale[1] = leg_scale;
+        tp->adm_scale[2] = 0.8f;
+        tp->adm_scale[3] = 0.8f;
+        tp->adm_scale[4] = 0.8f;
+        tp->adm_scale[5] = 0.8f;
+        break;
+    }
+    case PHASE_CARRY: {
+        /* 按负载调度: 重载高阻尼低刚度 (稳), 轻载低阻尼高刚度 (响应)
+         *   臂: adm = 0.7 (搬运稳为主)
+         *   腿: 支撑需高刚度 adm = 1.3 */
+        const EndEffectorForce_t *fL = global_get_arm_force(0);
+        const EndEffectorForce_t *fR = global_get_arm_force(1);
+        float fmax = 0.0f;
+        if (fL) { float n = sqrtf(fL->fx*fL->fx + fL->fy*fL->fy); if (n > fmax) fmax = n; }
+        if (fR) { float n = sqrtf(fR->fx*fR->fx + fR->fy*fR->fy); if (n > fmax) fmax = n; }
+        /* 负载越大 → 腿越稳 (adm↑), 臂阻尼略增 (防抖) */
+        float load_factor = clampf_ph(fmax / 100.0f, 0.0f, 1.5f);
+        tp->adm_scale[0] = 1.1f + 0.4f * load_factor;
+        tp->adm_scale[1] = 1.1f + 0.4f * load_factor;
+        tp->adm_scale[2] = 0.7f + 0.2f * load_factor;
+        tp->adm_scale[3] = 0.7f + 0.2f * load_factor;
+        tp->adm_scale[4] = 0.7f + 0.2f * load_factor;
+        tp->adm_scale[5] = 0.7f + 0.2f * load_factor;
+        break;
+    }
+    case PHASE_FREE:
+    default: {
+        /* 透明: K=0, B=small → adm=0.3 (柔) */
+        for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+            tp->adm_scale[i] = 0.3f;
+        }
+        break;
+    }
+    }
+}
+
+/* ===== §D 主入口 100Hz ===== */
+void Global_PhaseScheduler_Update100Hz(void)
+{
+    TaskPhase_t *tp = &g_task_phase;
+
+    /* 1. 模式识别 + 去抖 */
+    PhaseMode_e detected = detect_mode();
+    mode_switch_debounce(detected);
+
+    /* 2. 计算相位/子状态 */
+    switch (tp->mode) {
+    case PHASE_GAIT:
+        /* 复用 control_isr.c 的 AO 步态相位 (0.0~1.0) */
+        tp->phase_val = g_gait_phase;
+        break;
+    case PHASE_SQUAT: {
+        /* 单调映射: 平均髋角 → [0,1] */
+        JointStatus_t *ls = joint_status_ptr(0);
+        JointStatus_t *rs = joint_status_ptr(1);
+        if (ls && rs) {
+            float qavg = 0.5f * ((float)ls->position + (float)rs->position) * MDEG_TO_RAD_PH;
+            tp->phase_val = map_range(qavg, tp->hip_min_rad, tp->hip_max_rad);
+        }
+        break;
+    }
+    case PHASE_CARRY:
+        tp->phase_val = 0.0f;   /* 无相位, 离散状态机 */
+        carry_substate_update();
+        break;
+    case PHASE_FREE:
+    default:
+        tp->phase_val = 0.0f;
+        break;
+    }
+
+    /* 3. 相位 → 导纳缩放 */
+    map_phase_to_admittance();
+
+    /* 4. 广播下发 adm_scale → JointUnitState.global_adm_scale */
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        JointUnitState_t *st = joint_runtime_ptr(i);
+        if (st) st->global_adm_scale = tp->adm_scale[i];
+    }
+}
+
+/* ===== 初始化 ===== */
+void global_phase_init(void)
+{
+    memset(&g_task_phase, 0, sizeof(g_task_phase));
+    g_task_phase.mode = PHASE_FREE;
+    g_task_phase.mode_candidate = PHASE_FREE;
+    g_task_phase.carry_sub = CARRY_IDLE;
+    g_task_phase.hip_min_rad = HIP_MIN_RAD_DEFAULT;
+    g_task_phase.hip_max_rad = HIP_MAX_RAD_DEFAULT;
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        g_task_phase.adm_scale[i] = 1.0f;
+    }
+    printf("[PHASE] §D scheduler ON: GAIT/SQUAT/CARRY/FREE dual-track (100Hz)\r\n");
+}
+
+const TaskPhase_t *global_phase_get(void) { return &g_task_phase; }
+PhaseMode_e        global_phase_mode(void) { return g_task_phase.mode; }
+
+======== 章节名: §E 位姿估计器 — ZUPT (100Hz) ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\global_pose.h
+/**
+ * @file global_pose.h
+ * @brief §E 基座/全身位姿漂移免疫 — 纯运动学 ZUPT (无 IMU)
+ *
+ * 适用: 可移动底盘 / 穿戴式外骨骼行走. 需全身位姿做重力补偿方向修正.
+ *
+ * 原理:
+ *   1. 接触检测 (无力传感器): 电机扭矩 + 速度 + 电流饱和度
+ *      站立腿: |vel| < 阈值 且 |tau| > 阈值 且 电流环非饱和
+ *   2. ZUPT: 检测到站立相 → 该足位姿在世界系锁定 (零速更新)
+ *   3. 基座位姿: 双足锁定 → 完全约束 (无漂移);
+ *               单足锁定 → 绕该足旋转 (仅 yaw 微漂, roll/pitch 由编码器链约束);
+ *               双足离地 → 纯运动学前向传播 (短时 <1s 漂移可忍)
+ *   4. 重力方向修正: 提取 base_pose 的 roll/pitch → 重力向量广播
+ *      供 §B ESO3 模型前馈 Gravity_Comp() 使用
+ *
+ * 无 IMU: 平地行走/站立搬运, ZUPT 每步校准一次, 漂移 < 1°/h.
+ *
+ * 注: 当前系统仅髋关节 (单连杆腿), FK 退化为单连杆; 若后续加膝/踝,
+ *     Forward_Kinematics_Foot() 需扩展为多连杆链.
+ */
+#ifndef __GLOBAL_POSE_H__
+#define __GLOBAL_POSE_H__
+
+#include "joint_unit.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ===== 基座位姿 (世界系) =====
+ * roll: 绕 x (侧倾); pitch: 绕 y (俯仰); yaw: 绕 z (偏航, 会微漂) */
+typedef struct {
+    float roll_rad;
+    float pitch_rad;
+    float yaw_rad;
+    uint8_t valid;        /* 1=位姿约束有效 (至少单足锁定), 0=悬空传播 */
+    uint8_t drift_bounded;/* 1=漂移有界 (双足锁定), 0=仅单足/悬空 */
+} BasePose_t;
+
+/* ===== 重力向量 (基座系, 单位向量) =====
+ * 直立时 g_base = [0, 0, -1].
+ * 基座俯仰 pitch → g_y = sin(pitch), g_z = -cos(pitch)
+ * 基座侧倾 roll  → g_x = sin(roll) (近似, 小角) */
+typedef struct {
+    float gx;
+    float gy;
+    float gz;
+} GravityVec_t;
+
+/* ===== 足端接触状态 ===== */
+typedef struct {
+    uint8_t contact;        /* 1=接触地面 (站立相), 0=摆动/离地 */
+    uint8_t contact_prev;   /* 上一拍 (边沿检测) */
+    uint8_t pose_locked;    /* 1=ZUPT 已锁定该足世界位姿 */
+    float  foot_x_world;    /* 锁定时的足端世界 x (m) */
+    float  foot_z_world;    /* 锁定时的足端世界 z (m) */
+} FootContact_t;
+
+/* ===== 全局位姿估计器状态 ===== */
+typedef struct {
+    BasePose_t    base_pose;
+    GravityVec_t  gravity_base;
+    FootContact_t foot[2];        /* 0=左, 1=右 */
+
+    /* 接触检测阈值 (可现场标定覆盖) */
+    float thr_contact_vel_rad_s;  /* 速度阈值: |vel| < 此值视为静止 */
+    float thr_contact_tau_nm;     /* 力矩阈值: |tau| > 此值视为承重 */
+    float thr_contact_sat;        /* 电流饱和度上限 (占位, 当前 0) */
+
+    /* 腿连杆长度 (m), 单连杆腿: 髋→足 */
+    float leg_length_m;
+} GlobalPose_t;
+
+extern GlobalPose_t g_global_pose;
+
+/* ===== API ===== */
+void global_pose_init(void);
+
+/* §E 主入口 100Hz: 接触检测 + ZUPT + 基座位姿 + 重力向量
+ * (用户原稿 1kHz, 此处 100Hz 已足够: 位姿变化慢, 节省 CPU) */
+void Global_Pose_Estimator_Update100Hz(void);
+
+/* 只读访问 */
+const BasePose_t   *global_pose_get_base(void);
+const GravityVec_t *global_pose_get_gravity(void);
+uint8_t             global_pose_drift_bounded(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __GLOBAL_POSE_H__ */
+
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\global_pose.c
+/**
+ * @file global_pose.c
+ * @brief §E 基座/全身位姿漂移免疫 — 纯运动学 ZUPT (无 IMU)
+ *
+ * 数据流:
+ *   关节反馈 (q, vel, tau) → 接触检测 → ZUPT 锁足 → 基座位姿解算
+ *   → 重力向量 (基座系) → 广播 (供 §B Gravity_Comp 修正)
+ *
+ * 简化 (当前硬件: 仅髋关节, 单连杆腿):
+ *   足端 FK (相对髋): foot_x = L·sin(q), foot_z = -L·cos(q)
+ *   双足锁定: base_yaw = atan2(foot_R - foot_L); base_pitch/roll 由髋角推
+ *   单足锁定: 基座绕该足旋转, yaw 由髋角差分推 (会微漂, ZUPT 每步校准)
+ */
+#include "global_pose.h"
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+
+#define MDEG_TO_RAD_PS   (1.7453292519943295e-05f)
+#define MNM_TO_NM_PS     (0.001f)
+
+GlobalPose_t g_global_pose;
+
+/* ===== 辅助 ===== */
+static inline float clampf_ps(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* ===== 单连杆腿足端正运动学 (相对髋关节, 二维平面) =====
+ * q: 髋角 (rad), 0=腿竖直向下; 正方向=屈髋 (腿前摆)
+ * 返回: foot_x (前向, m), foot_z (垂直, 向下为负) */
+static void foot_fk_single(float q_rad, float L_m, float *fx, float *fz)
+{
+    *fx =  L_m * sinf(q_rad);
+    *fz = -L_m * cosf(q_rad);
+}
+
+/* ===== 接触检测 (无力传感器) =====
+ * 判据: |vel| < 阈值 (静止) 且 |tau_clean| > 阈值 (承重) 且 电流不饱和
+ *   站立相: 腿承重 → 力矩大; 摆动相: 腿离地 → 力矩小、速度大 */
+static uint8_t detect_stance(uint8_t leg_idx)
+{
+    JointStatus_t      *fb = joint_status_ptr(leg_idx);
+    JointUnitState_t   *st = joint_runtime_ptr(leg_idx);
+    if (!fb || !st) return 0;
+
+    float vel = fabsf((float)fb->velocity * MDEG_TO_RAD_PS);
+    /* 用去零漂后的 tau (来自 §A), 更准 */
+    float tau = fabsf(st->tau_meas_nm);
+
+    GlobalPose_t *gp = &g_global_pose;
+    return (vel < gp->thr_contact_vel_rad_s) &&
+           (tau > gp->thr_contact_tau_nm);
+    /* saturation 占位: RobStride 01 当前反馈不带电流饱和度, 暂不判 */
+}
+
+/* ===== §E 主入口 100Hz ===== */
+void Global_Pose_Estimator_Update100Hz(void)
+{
+    GlobalPose_t *gp = &g_global_pose;
+
+    /* 1. 双腿接触检测 */
+    uint8_t left_contact  = detect_stance(0);
+    uint8_t right_contact = detect_stance(1);
+
+    /* 2. ZUPT: 上升沿 (刚接触) → 锁定该足世界位姿 */
+    if (left_contact && !gp->foot[0].contact_prev) {
+        JointStatus_t *fb = joint_status_ptr(0);
+        if (fb) {
+            float q = (float)fb->position * MDEG_TO_RAD_PS;
+            float fx, fz;
+            foot_fk_single(q, gp->leg_length_m, &fx, &fz);
+            /* 锁定时: 足端世界位姿 = 当前基座估计 + FK 偏移
+             * 简化: 假设基座在原点附近, 足世界 ≈ FK (相对基座) */
+            gp->foot[0].foot_x_world = fx;
+            gp->foot[0].foot_z_world = fz;
+            gp->foot[0].pose_locked = 1u;
+        }
+    }
+    if (right_contact && !gp->foot[1].contact_prev) {
+        JointStatus_t *fb = joint_status_ptr(1);
+        if (fb) {
+            float q = (float)fb->position * MDEG_TO_RAD_PS;
+            float fx, fz;
+            foot_fk_single(q, gp->leg_length_m, &fx, &fz);
+            gp->foot[1].foot_x_world = fx;
+            gp->foot[1].foot_z_world = fz;
+            gp->foot[1].pose_locked = 1u;
+        }
+    }
+    /* 离地时清除锁定 (避免用旧锁点) */
+    if (!left_contact)  gp->foot[0].pose_locked = 0u;
+    if (!right_contact) gp->foot[1].pose_locked = 0u;
+
+    gp->foot[0].contact_prev = left_contact;
+    gp->foot[1].contact_prev = right_contact;
+
+    /* 3. 基座位姿解算 */
+    JointStatus_t *ls = joint_status_ptr(0);
+    JointStatus_t *rs = joint_status_ptr(1);
+    float qL = ls ? (float)ls->position * MDEG_TO_RAD_PS : 0.0f;
+    float qR = rs ? (float)rs->position * MDEG_TO_RAD_PS : 0.0f;
+
+    if (gp->foot[0].pose_locked && gp->foot[1].pose_locked) {
+        /* 双足锁定: 基座完全约束, 无漂移
+         *   base_pitch ≈ 平均髋角 (双腿都屈 → 躯干前倾)
+         *   base_roll  ≈ 髋角差 / 2 (单侧屈 → 侧倾)
+         *   base_yaw   由双足横向偏移决定 (此处单连杆无横向, yaw 保持) */
+        gp->base_pose.pitch_rad = 0.5f * (qL + qR);
+        gp->base_pose.roll_rad  = 0.5f * (qL - qR);
+        /* yaw 不更新 (双足都在 sagittal 平面, 无 yaw 信息) */
+        gp->base_pose.valid        = 1u;
+        gp->base_pose.drift_bounded = 1u;
+    } else if (gp->foot[0].pose_locked || gp->foot[1].pose_locked) {
+        /* 单足锁定: 基座绕该足旋转
+         *   pitch/roll 由编码器链约束 (相对锁足), yaw 微漂 */
+        uint8_t stance = gp->foot[0].pose_locked ? 0u : 1u;
+        float q_stance = (stance == 0u) ? qL : qR;
+        /* 基座俯仰 ≈ 支撑腿髋角 (支撑腿竖直 → 躯干竖直) */
+        gp->base_pose.pitch_rad = q_stance;
+        gp->base_pose.roll_rad  = 0.5f * (qL - qR);
+        gp->base_pose.valid        = 1u;
+        gp->base_pose.drift_bounded = 0u;   /* 单足: yaw 漂移未约束 */
+    } else {
+        /* 双足离地 (飞行相/搬运悬空): 纯运动学前向传播
+         *   短时 (<1s) 漂移可忍, 不更新 pitch/roll (保持上一拍) */
+        gp->base_pose.valid        = 0u;
+        gp->base_pose.drift_bounded = 0u;
+    }
+
+    /* 4. 重力向量 (基座系) 广播
+     *   直立: g = [0, 0, -1]
+     *   基座俯仰 pitch → g_y = sin(pitch), g_z = -cos(pitch)
+     *   基座侧倾 roll  → g_x = sin(roll) (小角近似, 忽略耦合) */
+    float pitch = gp->base_pose.pitch_rad;
+    float roll  = gp->base_pose.roll_rad;
+    gp->gravity_base.gx =  sinf(roll);
+    gp->gravity_base.gy =  sinf(pitch) * cosf(roll);
+    gp->gravity_base.gz = -cosf(pitch) * cosf(roll);
+
+    /* 钳位: 单位向量模长 ≈ 1 */
+    float norm = sqrtf(gp->gravity_base.gx * gp->gravity_base.gx +
+                       gp->gravity_base.gy * gp->gravity_base.gy +
+                       gp->gravity_base.gz * gp->gravity_base.gz);
+    if (norm > 1e-6f) {
+        gp->gravity_base.gx /= norm;
+        gp->gravity_base.gy /= norm;
+        gp->gravity_base.gz /= norm;
+    }
+}
+
+/* ===== 初始化 ===== */
+void global_pose_init(void)
+{
+    memset(&g_global_pose, 0, sizeof(g_global_pose));
+    /* 接触检测默认阈值 (现场标定覆盖) */
+    g_global_pose.thr_contact_vel_rad_s = 0.05f;   /* ~2.9 °/s 视为静止 */
+    g_global_pose.thr_contact_tau_nm    = 1.0f;    /* 1 Nm 视为承重 */
+    g_global_pose.thr_contact_sat       = 0.5f;
+    g_global_pose.leg_length_m          = 0.70f;   /* 髋→足 ~70cm (现场标定) */
+    /* 直立重力向量 */
+    g_global_pose.gravity_base.gz = -1.0f;
+    g_global_pose.base_pose.valid = 0u;
+    printf("[POSE] §E ZUPT pose estimator ON: contact-detect + dual-foot lock (100Hz)\r\n");
+}
+
+const BasePose_t   *global_pose_get_base(void)     { return &g_global_pose.base_pose; }
+const GravityVec_t *global_pose_get_gravity(void)  { return &g_global_pose.gravity_base; }
+uint8_t             global_pose_drift_bounded(void){ return g_global_pose.base_pose.drift_bounded; }
+
+======== 章节名: 100Hz 主循环链路 (tasks.c) ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\tasks.c
+// (仅贴入 control_task_run 与 tasks_init 两个函数, 函数前后各留一行空行)
+
+void control_task_run(void)
+{
+    /* v1.7 legacy: 单关节低通负载估计 → ABO 增益调度 */
+    industrial_load_estimator();
+
+    /* §C 全局协调器 100Hz: 全身运动学逆动力学 → 末端外力 F_ext
+     * → 回映射 per-joint payload_tau → 下发给 JointUnit.eso3.payload_est
+     *    供 §B ESO3 模型前馈剥离 "手里的 20kg" 这类全局负载
+     * → 负载突变时触发 §C-boost (ESO β3×3 + 遗忘旧 z3) */
+    Global_LoadEstimator_Update100Hz();
+
+    /* §D 相位调度器 100Hz: 模式识别 (GAIT/SQUAT/CARRY/FREE) + 相位/导纳映射
+     * → 下发 adm_scale → JointUnitState.global_adm_scale */
+    Global_PhaseScheduler_Update100Hz();
+
+    /* §E 位姿估计器 100Hz: 接触检测 + ZUPT + 基座位姿 → 重力向量 (基座系)
+     *    供 §B Gravity_Comp 修正 (数据流接入待定) */
+    Global_Pose_Estimator_Update100Hz();
+
+    safety_task_run();
+    safety_handle_fault();
+}
+
+void tasks_init(void)
+{
+    eeprom_init();
+    udp_net_init();
+    global_coordinator_init();   /* §C 全局协调器 (100Hz 负载估计器) */
+    global_phase_init();         /* §D 相位调度器 (GAIT/SQUAT/CARRY/FREE) */
+    global_pose_init();          /* §E 位姿估计器 (ZUPT + 重力向量) */
+
+    /* §E → §B 数据流闭环: 绑定基座系重力向量指针 (上电一次)
+     *   指向 g_global_pose.gravity_base.gx (GravityVec_t 三个连续 float)
+     *   1kHz ISR 只读, Cortex-M4 单 float 原子, 无撕裂 */
+    for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+        joint_bind_gravity_vector(i, &g_global_pose.gravity_base.gx);
+    }
+}
+
+======== 章节名: 1kHz ISR 注入点 (control_isr.c) ========
+// 源文件: e:\DL26-7-20\f407\project\trae-ecc\App\control\control_isr.c
+// (HAL_TIM_PeriodElapsedCallback → control_isr_process() 内, 注释起至 boost tick 右大括号)
+    /* ====== 零 IMU 漂移免疫包 §A + §B (1kHz, 每关节) ======
+     *  §A: 温度表 + 零负载窗口 在线力矩零漂修正
+     *  §B: ESO3 抗漂移 (默认 eso_enable=0 不运行, 保 legacy ABO 兼容)
+     *  必须放在 ABO/控制计算之前, 以便 tau_meas_nm 已经去漂. */
+    {
+        const float dt_s = 0.001f;   /* 1 ms */
+        for (uint8_t i = 0; i < JOINT_COUNT; i++) {
+            joint_drift_immune_update1kHz(i, dt_s);
+        }
+        /* §C-boost: 1kHz 递减 boost timer (100Hz 触发, 1kHz 衰减) */
+        joint_eso_boost_tick_1kHz();
+    }
+
+======== 章节名: 数据流闭环说明（文字，非代码）========
+
+【两级数据流闭环说明】
+
+STM32F407 单芯片内, 算法分为 100Hz 全局层 (tasks.c 主循环) 与 1kHz 分布式层
+(control_isr.c 定时器中断) 两级。两级间通过 JointUnitState 共享状态, 所有跨频
+读写均为单 float, 利用 Cortex-M4 单精度浮点原子性实现无锁通信, 无数据撕裂。
+
+────────────────────────────────────────────────────────────────────────
+[100Hz 全局层] tasks.c :: control_task_run()
+────────────────────────────────────────────────────────────────────────
+
+  §C Global_LoadEstimator_Update100Hz()
+    ├─ 逆动力学: tau_meas - G(q) = J^T · F_ext  (双臂 2-DOF 伪逆)
+    ├─ 下发 payload_est ──► JointUnit.eso3.payload_est   (每关节)
+    └─ 负载突变检测 ──► joint_trigger_eso_boost()         (§C-boost)
+
+  §D Global_PhaseScheduler_Update100Hz()
+    ├─ 模式识别: GAIT / SQUAT / CARRY / FREE
+    └─ 下发 adm_scale ──► JointUnit.global_adm_scale       (每关节)
+
+  §E Global_Pose_Estimator_Update100Hz()
+    ├─ 接触检测 + ZUPT 锁足 → 基座位姿 (roll/pitch/yaw)
+    └─ 广播 gravity_base ──► JointUnit.gravity_base_ptr    (上电一次绑定)
+
+────────────────────────────────────────────────────────────────────────
+                         │ 单 float 原子读写 (Cortex-M4 无锁)
+                         ▼
+────────────────────────────────────────────────────────────────────────
+[1kHz 分布式层] control_isr.c :: control_isr_process()
+  每关节独立运行 (6 × JointUnit, DRIFT_IMMUNE_ENABLE=1):
+────────────────────────────────────────────────────────────────────────
+
+   §A tau_meas ──► §B ESO3(tau_cmd) ──► tau_human ──► §D 导纳 ──► tau_cmd ─┐
+     ▲                                                                     │
+     └─────────────────────────────────────────────────────────────────────┘
+                                  (闭环反馈)
+
+  §A TorqueDrift_Update1kHz     : 温度表插值 + 零负载窗口在线标定
+  §B JointUnit_ESO3_Update1kHz  : 模型前馈 + 自适应 beta3 + 无激励冻结
+  §D Admittance_Update1kHz      : M·ddx + B·dx + K·x = tau_human
+
+  注: 默认 eso_enable=0 → §B/§D 不运行, 走 legacy ABO + PID (向后兼容)
+      标定后置 eso_enable=1 → 启用 §A+§B+§D 全链路 (漂移免疫)
+
+────────────────────────────────────────────────────────────────────────
+[跨频通信约束]
+────────────────────────────────────────────────────────────────────────
+  - 100Hz→1kHz 下发: payload_est / global_adm_scale / gravity_base 均为单 float
+  - 1kHz→100Hz 上传: tau_meas_nm / tau_human_nm (供 §C 逆动力学读)
+  - Cortex-M4 (VFPv4-SP) 单精度 float 读写单周期原子, 无需关中断/锁
+  - 无 IMU: §E 仅用编码器角度 + 力矩做 ZUPT, 漂移每步校准
+  - 仅 ABS 编码器 + 相电流(力矩) + CAN 总线, 满足单芯片硬约束
+
+【默认/启用状态】
+  - 默认 eso_enable = 0: 走 legacy ABO + PID, 保持原系统行为不变
+  - 现场标定 (温度表 / theta0 / grav_arm) 后置 eso_enable = 1:
+      启用 §A 零漂 + §B ESO3 + §D 导纳 全链路 → 实现"零 IMU 漂移免疫"
+
+【ASCII 数据流总览】
+
+  ┌──────── 100Hz 全局 (control_task_run) ────────┐
+  │  §C payload_est ──┐                          │
+  │  §D adm_scale ─────┼──► JointUnitState ──┐    │
+  │  §E gravity_base ──┘    (单 float 下发)   │    │
+  └──────────────────────────────────────────┼────┘
+                                             │
+                            ┌────────────────┴────────────────┐
+                            ▼ 1kHz 分布式 (control_isr_process)▼
+   ┌─ per joint ───────────────────────────────────────────────┐
+   │                                                            │
+   │  tau_raw ─[§A]─► tau_meas ─[§B]─► tau_human ─[§D]─► tau_cmd│
+   │      ▲                                              │      │
+   │      └────────────── (反喂 ESO3 u 项) ◄────────────┘      │
+   └────────────────────────────────────────────────────────────┘
