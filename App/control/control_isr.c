@@ -140,52 +140,44 @@ static void abo_update_one(uint8_t idx, JointStatus_t *js, JointCommand_t *cmd)
     /* 1. 实时测量力矩 (mNm, 电机相电流推算) */
     int32_t tau_meas = js->torque;
 
-    /* ★ fix(安全): 扣除 ABO 上一周期下发的助力, 得到「外部力矩」再做偏置/带通。
-     *   原代码直接对 tau_meas 做 HPF → assist→命令→tau_meas→HPF→tau_human→assist
-     *   构成正反馈; 工业模式 gain=1.0 + bias leak≈60s → 环路增益≈1 → 电机狂转。
-     *   扣除后: 稳态 tau_meas≈命令 → 残差≈0, 仅外部扰动 transient 通过, 保证稳定。
-     *   g_abo_assist_torque[idx] 在上周期末写入, 本周期初即「上周期 assist」。
-     *   偏置也随之只跟踪外部(重力/摩擦)力矩, 不再吞掉自身 assist, 行为更正确。 */
-    tau_meas -= g_abo_assist_torque[idx];
-
     if (abo->industrial_mode) {
-        /* ========== v1.7: 工业模式 ==========
-         * 原则: 偏置只吸「电机零漂+恒定摩擦」, 绝不吸外部负载/人力
-         *   - leak 极小 (~60s 时常数), 负载突变时冻结
-         *   - 带通 0.5-5Hz 提取人力 (双 HPF 串联近似)
-         *   - 增益按负载估计调度: 轻载高增益, 重载低增益 */
+        /* ========== v1.7: 工业模式 (速度推断人力) ==========
+         * ★ fix: 纯力矩模式下 tau_meas≈命令, 不反映静态人力; 用 tau_meas 做带通
+         *   会把命令变化误当人力 → 正反馈狂转 / 扣除assist又引入振荡。
+         *   改用速度推断: 人推→关节速度→同向助力(负阻尼, 帮助运动方向)。
+         *   稳定保障: 死区(防漂移) + 速度上限(防过速) + 输出LPF(防振荡) + 严格限幅。
+         *   偏置估计保留(吸收重力, 供负载调度), 但不再用于人力提取。 */
 
-        /* (a) 负载突变检测: 力矩跳变 > 2000 mNm 或方向反转 */
+        /* (a) 负载突变检测: 力矩跳变冻结偏置 (偏置不应跟负载突变) */
         int32_t dtau = tau_meas - abo->tau_prev;
         abo->tau_prev = tau_meas;
         if (dtau > 2000 || dtau < -2000) {
             abo->load_freeze_cnt = 500;  /* 冻结偏置 500ms */
         }
-        /* 冻结期间不积分偏置 (leak=0), 解冻后恢复极小 leak */
         int32_t ind_leak = abo->load_freeze_cnt ? 0 : 10;  /* 10/65536 ≈ 60s */
         if (abo->load_freeze_cnt) abo->load_freeze_cnt--;
 
-        /* (b) 偏置极慢积分 (只跟零漂/恒定摩擦) */
+        /* (b) 偏置极慢积分 (只跟零漂/恒定摩擦, 供负载估计用) */
         int32_t bias_err = tau_meas - abo->bias_est;
         abo->bias_est += (ind_leak * bias_err) >> 16;
 
-        /* (c) 人力提取: 带通 0.5-5Hz
-         *   HPF1: fc≈0.5Hz, alpha=200/65536 ≈ 0.003
-         *   LPF:  fc≈5Hz,   alpha=2000/65536 ≈ 0.03 */
-        int32_t tau_disturb = tau_meas - abo->bias_est;
-        int32_t hpf1_err = tau_disturb - abo->hpf_state;
-        abo->hpf_state += (200 * hpf1_err) >> 16;     /* HPF1: 去 0Hz */
-        int32_t lpf_err = abo->hpf_state - abo->bp_lpf_state;
-        abo->bp_lpf_state += (2000 * lpf_err) >> 16;   /* LPF: 去 >5Hz */
-        int32_t tau_human = abo->bp_lpf_state;
+        /* (c) ★ 速度推断人力 (替代带通)
+         *   人推→关节产生速度→输出同向助力。死区滤除噪声/漂移,
+         *   速度上限防过速失控。vel>0→tau>0(帮助正转), 负阻尼性质。 */
+        float vel_rad_s = (float)js->velocity / RAD_TO_MDEG;  /* mdeg/s → rad/s */
+        const float VEL_DEADZONE = 0.15f;   /* rad/s ≈ 8.6°/s, 低于此视为噪声 */
+        const float VEL_MAX      = 3.0f;    /* rad/s ≈ 172°/s, 超过不助力防过速 */
+        const float K_VEL        = 0.6f;    /* 负阻尼系数 Nm·s/rad (须<系统摩擦) */
+        float vel_abs = (vel_rad_s >= 0) ? vel_rad_s : -vel_rad_s;
+        float tau_human_f = 0.0f;
+        if (vel_abs > VEL_DEADZONE && vel_abs < VEL_MAX) {
+            float vel_eff = (vel_rad_s >= 0) ? (vel_rad_s - VEL_DEADZONE)
+                                              : (vel_rad_s + VEL_DEADZONE);
+            tau_human_f = K_VEL * vel_eff;   /* Nm, 同向助力 */
+        }
+        int32_t tau_human = (int32_t)(tau_human_f * 1000.0f);  /* mNm */
 
-        /* (d) 负载估计由 tasks.c:industrial_load_estimator() 异步更新 (100Hz LPF)
-         *   此处直接读取 load_est_q10, 不再自行估算 */
-
-        /* (e) 增益调度: 按准静态负载分档
-         *   load < 5 N·m  → 1.0× (空载/轻载, 全力跟随)
-         *   load < 15 N·m → 0.5× (中载, 防超功率)
-         *   load ≥ 15 N·m → 0.25× (重载, 仅微辅助) */
+        /* (d) 增益调度: 按准静态负载分档 (load_est 由 tasks.c 异步更新) */
         int32_t load_abs = abo->load_est_q10;
         if (load_abs < 0) load_abs = -load_abs;
         int32_t gain;
@@ -198,9 +190,12 @@ static void abo_update_one(uint8_t idx, JointStatus_t *js, JointCommand_t *cmd)
         }
         abo->assist_gain_q10 = (uint16_t)gain;
 
-        /* (f) 助力输出 */
-        int32_t tau_assist = mode_get_abo_enabled() ? ((gain * tau_human) >> 10) : 0;
-        tau_assist = clamp_int32_local(tau_assist, -3000, 3000);
+        /* (e) 助力输出 + 一阶LPF平滑(防振荡) + 严格限幅(防失控) */
+        int32_t tau_assist_raw = mode_get_abo_enabled() ? ((gain * tau_human) >> 10) : 0;
+        /* 复用 hpf_state 字段存上周期输出, α=5000/65536≈0.076 → fc≈12Hz */
+        abo->hpf_state += (5000 * (tau_assist_raw - abo->hpf_state)) >> 16;
+        int32_t tau_assist = abo->hpf_state;
+        tau_assist = clamp_int32_local(tau_assist, -1500, 1500);  /* ±1.5 N·m */
 
         g_abo_assist_torque[idx] = tau_assist;
         if (cmd->control_mode == CTRL_MODE_TORQUE || cmd->control_mode == CTRL_MODE_MIXED) {
@@ -323,12 +318,13 @@ volatile uint32_t    g_local_gait_start_ms = 0;
 #define LOCAL_GAIT_NUM_POINTS     5
 
 static const int32_t g_local_gait_table[LOCAL_GAIT_NUM_POINTS][2] = {
-    /* Left Hip, Right Hip (mdeg) */
-    {       0,   60000 },   /*   0% */
-    {   30000,   30000 },   /*  25% */
-    {   60000,       0 },   /*  50% */
-    {   30000,   30000 },   /*  75% */
-    {       0,   60000 }    /* 100% */
+    /* Left Hip, Right Hip (mdeg)
+     * ★ fix: 摆幅 60°→30° (原 0~60000 过大, 正常行走髋屈伸约±25°, 硬拉60°致僵硬对抗) */
+    {       0,   30000 },   /*   0% */
+    {   15000,   15000 },   /*  25% */
+    {   30000,       0 },   /*  50% */
+    {   15000,   15000 },   /*  75% */
+    {       0,   30000 }    /* 100% */
 };
 
 /* 平滑输出 (当前目标角度, 用于梯形速度插值) */
@@ -583,24 +579,28 @@ static void local_cmd_generate(JointCommand_t cmd[6])
                     (0.5f + 0.3f * sinf(two_pi * arm_phi));
 
                 /* v1.6.9fix: K/B 连续调制 (避免 phi=0.5 跳变振荡)
-                 * 站立相(phi≈0.5)大, 摆动相(phi≈0/1)小, 用余弦平滑过渡 */
+                 * 站立相(phi≈0.5)大, 摆动相(phi≈0/1)小, 用余弦平滑过渡
+                 * ★ fix: 大幅降低 K (原 0.3~1.5 → 0.1~0.5), 减弱主动拉扯对抗 */
                 float phase_gain = 0.5f - 0.5f * cosf(two_pi * phi);  /* 0→1→0, 站立相=1 */
-                float K = is_shoulder ? (0.3f + 1.2f * phase_gain) : (0.1f + 0.7f * phase_gain);
-                float B = is_shoulder ? (0.2f + 1.0f * phase_gain) : (0.05f + 0.3f * phase_gain);
+                float K = is_shoulder ? (0.1f + 0.4f * phase_gain) : (0.05f + 0.25f * phase_gain);
+                float B = is_shoulder ? (0.1f + 0.5f * phase_gain) : (0.03f + 0.15f * phase_gain);
 
                 /* ★ fix(方向): 臂电机正方向 = 解剖反方向 (4 臂关节全部反相, 用户确认)。
                  *   阻抗在解剖系定义: τ_a = K(ref_a - pos_a) - B·vel_a。
                  *   坐标变换 pos_a = S·pos_m, τ_m = S·τ_a (S=-1) → S²=1 使 pos/vel 项不变,
-                 *   仅 ref 项乘 S: τ_m = K(S·ref_a - pos_m) - B·vel_m。
-                 *   故 ref 取反。ABO 测量/命令同在电机系, S 自动抵消, 无需改动。 */
+                 *   仅 ref 项乘 S: τ_m = K(S·ref_a - pos_m) - B·vel_m。故 ref 取反。 */
                 const float ARM_DIR = -1.0f;
                 /* 阻抗力矩 (Nm → mNm): τ = K(S·ref - pos) + B(0 - vel) */
                 float tau_imp = (K * (ARM_DIR * ref - pos_rad) + B * (0.0f - vel_rad)) * 1000.0f;
 
+                /* ★ fix: 力矩死区 — |τ_imp|<150mNm 时不输出, 避免零位附近持续小力拉扯
+                 *   (零位未标定时 pos 有偏移, 死区让小偏差不产生持续对抗) */
+                if (tau_imp > -150.0f && tau_imp < 150.0f) tau_imp = 0.0f;
+
                 /* 3) 合成 + 限幅 (mNm)
-                 * ★ v1.6.9fix2: 限幅从 ±2000 降到 ±500 (0.5 N·m), 防止大力矩对抗用户 */
+                 * ★ fix: 限幅 ±500→±300 (0.3 N·m), 更柔软安全 */
                 int32_t tau_total = (int32_t)(tau_ff + tau_imp);
-                tau_total = clamp_int32_local(tau_total, -500, 500);  /* ±0.5 N·m, 柔软安全 */
+                tau_total = clamp_int32_local(tau_total, -300, 300);  /* ±0.3 N·m, 柔软 */
 
                 cmd[i].control_mode = CTRL_MODE_TORQUE;
                 cmd[i].syn_target   = tau_total;

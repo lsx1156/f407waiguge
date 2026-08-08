@@ -567,7 +567,8 @@ void can_motor_send_command(CAN_HandleTypeDef *hcan, uint32_t motor_id,
             float torque_ff = (float)g_abo_assist_torque[abo_idx] / 1000.0f;
             uint16_t t_uint = (uint16_t)float_to_uint(torque_ff, CG_T_MIN, CG_T_MAX, 16);
             g_can1_tx_header.ExtId = cybergear_pack_ext_id(CG_CMD_MIT_CTRL, t_uint, (uint8_t)motor_id);
-            cybergear_mit_pack_command(motor_id, pos_rad, 0.0f, 10.0f, 0.5f, g_can1_tx_data);
+            /* ★ fix: Kp 10→3, Kd 0.5→1.0 — 降低位置刚度(防僵硬对抗), 增大阻尼(防振荡) */
+            cybergear_mit_pack_command(motor_id, pos_rad, 0.0f, 3.0f, 1.0f, g_can1_tx_data);
         }
         status = HAL_CAN_AddTxMessage(hcan, &g_can1_tx_header, g_can1_tx_data, &tx_mailbox);
         if (status == HAL_OK) {
