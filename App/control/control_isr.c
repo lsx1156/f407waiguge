@@ -997,7 +997,18 @@ void control_isr_process(void)
         }
     }
 
-    /* v1.6.9: ABO 调试打印 (每秒 1 次), 验证助力链路 — P0 排查临时开启 */
+    /* ★ v2.1.1 fix(采集阻塞, 2026-09-12): 本段原为无条件执行, 位于 1kHz TIM6 ISR
+     *   (NVIC 优先级 0) 内, 而 __io_putchar 是逐字符忙等 UART (USART1 @115200)。
+     *   每秒 7 行 ≈495 字符 → 阻塞 ≈43 ms/秒, 后果:
+     *     · 每秒 43ms 控制中断被占住 (电机维持上一条指令)
+     *     · 每秒少生成 ~43 帧上报 —— 且 seq 仍连续, 序列号缺口检测无法发现
+     *       (实测 rate 958Hz / coverage 95.69% / max_dt 44ms)
+     *   故默认关闭。台架静态调试可置 1, 但【禁止在数据采集时开启】。
+     *   若需长期保留调试输出, 应改为 "ISR 置标志位 + 主循环打印"。 */
+#ifndef ABO_ISR_DEBUG_PRINT
+#define ABO_ISR_DEBUG_PRINT   0
+#endif
+#if ABO_ISR_DEBUG_PRINT
     {
         static uint32_t abo_dbg_ts = 0;
         uint32_t now = HAL_GetTick();
@@ -1025,6 +1036,7 @@ void control_isr_process(void)
             }
         }
     }
+#endif  /* ABO_ISR_DEBUG_PRINT */
 
     ReportFrame_t frame;
     report_frame_build(&frame, g_leg_status, g_arm_status);

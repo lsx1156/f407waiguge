@@ -66,10 +66,20 @@ static void udp_recv_callback(void *arg, struct udp_pcb *upcb, struct pbuf *p, c
         upcb->remote_ip = *addr;
         upcb->remote_port = port;
         
+        /* ★ 2026-09-12 加固: 本文件为【未被任何工程引用的残留副本】(死代码)。
+         *   实际编译的是 Middlewares/arch/udp_net.c (已有完整长度校验)。
+         *   此处补齐同样的下界校验, 拆掉"若被误加入工程即越界读"的地雷:
+         *   原代码在 data_len 为 0/1 时 data_len-2 无符号下溢 → crc16 顺序越界读约 4GB (UB)。 */
+        if (data_len < FRAME_HEADER_SIZE + CRC_SIZE) {
+            pbuf_free(p);
+            return;
+        }
+
         uint8_t frame_type = buf[0];
         switch (frame_type) {
             case FRAME_TYPE_COMMAND:
             {
+                if (data_len < COMMAND_FRAME_SIZE) break;
                 CommandFrame_t *frame = (CommandFrame_t *)buf;
                 if (frame->crc == crc16(buf, data_len - 2)) {
                     JointCommand_t commands[6];
@@ -80,6 +90,7 @@ static void udp_recv_callback(void *arg, struct udp_pcb *upcb, struct pbuf *p, c
             }
             case FRAME_TYPE_PARAM:
             {
+                if (data_len < FRAME_HEADER_SIZE + 4 + CRC_SIZE) break;   /* ★ 变长帧下界 */
                 ParamFrame_t *frame = (ParamFrame_t *)buf;
                 uint16_t *crc_ptr = (uint16_t *)(buf + data_len - 2);
                 if (*crc_ptr == crc16(buf, data_len - 2)) {
@@ -123,6 +134,7 @@ static void udp_recv_callback(void *arg, struct udp_pcb *upcb, struct pbuf *p, c
             }
             case FRAME_TYPE_HEARTBEAT:
             {
+                if (data_len < HEARTBEAT_FRAME_SIZE) break;               /* ★ 防短包误触发 ESTOP */
                 HeartbeatFrame_t *hb_frame = (HeartbeatFrame_t *)buf;
                 if (hb_frame->data == 0xFFFF) {
                     fault_fifo_write(FAULT_ESTOP);

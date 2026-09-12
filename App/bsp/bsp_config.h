@@ -247,7 +247,9 @@
 
 /* ========== FIFO Configuration ========== */
 
-#define FIFO_REPORT_SIZE     32
+#define FIFO_REPORT_SIZE     128   /* ★ v2.1.1 (2026-09-12): 32→128. 1kHz 下原 32 帧仅 32ms
+                                    *   缓冲, 主循环/LwIP 一有停顿即静默丢帧。128 帧=128ms
+                                    *   (128×112B=14KB RAM, 实测 RAM 占用 64.66KB/128KB, 有余量) */
 #define FIFO_COMMAND_SIZE    4
 #define FIFO_FAULT_SIZE      4
 
