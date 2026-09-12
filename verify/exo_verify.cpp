@@ -111,10 +111,13 @@ struct PlantParams {
 
 /* 人体输入模式 */
 struct HumanInput {
-    int    mode;         // 0=恒力阶跃 1=斜坡 2=正弦 3=脉冲串 4=零(自激测试)
-    double amp;          // N·m
+    int    mode;         // 0=正弦摆荡 1=含二次谐波 2=步态样屈快伸慢 3=摆荡+直流偏置 4=零(自激测试)
+    double amp_pos;      // 意图摆荡幅值 rad (肢体摆幅)
+    double freq;         // Hz
     double t_on, t_off;  // s
-    double freq;         // Hz(正弦)
+    double Kh;           // 人体关节刚度 N·m/rad
+    double Bh;           // 人体关节阻尼 N·m·s/rad
+    double tau_max;      // 人体最大力矩 N·m
 };
 
 struct TrialResult {
@@ -155,16 +158,39 @@ static TrialResult run_trial(const CtrlParams *cp, const PlantParams *pp,
 
     for (int k = 0; k < n; k++) {
         double t = k * DT;
-        // ---- 人体输入 (真实化: 力矩上限 + 150ms 肌肉上升沿) ----
+        // ---- 人体输入: 阻抗跟踪周期性意图轨迹(物理自洽: 力矩受刚度/阻尼与上限约束) ----
         double th_target = 0.0;
-        switch (hi->mode) {
-            case 0: th_target = (t >= hi->t_on && t < hi->t_off) ? hi->amp : 0.0; break;
-            case 1: th_target = (t >= hi->t_on && t < hi->t_off) ? hi->amp * (t - hi->t_on) / (hi->t_off - hi->t_on) : 0.0; break;
-            case 2: th_target = (t >= hi->t_on && t < hi->t_off) ? hi->amp * sin(2 * M_PI * hi->freq * (t - hi->t_on)) : 0.0; break;
-            case 3: th_target = ((int)(t * 4) % 2 == 0 && t >= hi->t_on && t < hi->t_off) ? hi->amp : 0.0; break;
-            default: th_target = 0.0;
+        double t_act = t - hi->t_on;
+        if (hi->mode != 4 && t >= hi->t_on && t < hi->t_off) {
+            double w = 2 * M_PI * hi->freq;
+            double th_ref = 0.0, dth_ref = 0.0;
+            switch (hi->mode) {
+                case 0:   // 纯正弦摆荡
+                    th_ref  = hi->amp_pos * sin(w * t_act);
+                    dth_ref = hi->amp_pos * w * cos(w * t_act);
+                    break;
+                case 1:   // 含二次谐波(屈伸不对称)
+                    th_ref  = hi->amp_pos * (0.75 * sin(w * t_act) + 0.25 * sin(2 * w * t_act));
+                    dth_ref = hi->amp_pos * w * (0.75 * cos(w * t_act) + 0.5 * cos(2 * w * t_act));
+                    break;
+                case 2: { // 步态样: 屈曲快、伸展慢(周期性曲折)
+                    double ph = fmod(hi->freq * t_act, 1.0);
+                    if (ph < 0.4) { th_ref = hi->amp_pos * sin(M_PI * ph / 0.4);
+                                    dth_ref = hi->amp_pos * M_PI / 0.4 * cos(M_PI * ph / 0.4) * hi->freq * 2 * M_PI / (2 * M_PI); }
+                    else          { th_ref = -hi->amp_pos * sin(M_PI * (ph - 0.4) / 0.6);
+                                    dth_ref = -hi->amp_pos * M_PI / 0.6 * cos(M_PI * (ph - 0.4) / 0.6) * hi->freq * 2 * M_PI / (2 * M_PI); }
+                    dth_ref *= 1.0;
+                    break; }
+                default:  // 周期摆荡 + 直流偏置(一边抗重力一边摆动)
+                    th_ref  = hi->amp_pos * (0.5 + 0.5 * sin(w * t_act));
+                    dth_ref = hi->amp_pos * 0.5 * w * cos(w * t_act);
+                    break;
+            }
+            // 人体关节阻抗: τ = Kh(θref−θ) + Bh(θ̇ref−θ̇), 并按人体最大力矩限幅
+            th_target = clampd(hi->Kh * (th_ref - theta) + hi->Bh * (dth_ref - omega),
+                               -hi->tau_max, hi->tau_max);
         }
-        th_muscle += (th_target - th_muscle) * (DT / 0.15);   // 肌肉一阶上升 150ms
+        th_muscle += (th_target - th_muscle) * (DT / 0.05);   // 肢体动态上升 ~50ms
         double th = th_muscle;
         // ---- 传感: 量化 + 噪声 + 延迟 ----
         double v_q = round(omega / pp->vq) * pp->vq;
@@ -205,7 +231,7 @@ static TrialResult run_trial(const CtrlParams *cp, const PlantParams *pp,
     // 重力补偿: 无人力时臂应"零重力"停在释放位附近(不坠不漂)
     if (hi->mode == 4 && fabs(theta - th0_init) > 0.30) r.grav_flag = 1;
     // 方向: 人力与助力应同号相关
-    if (hi->mode == 0 && fabs(hi->amp) > 2.0) {
+    if (hi->mode == 0 && hi->amp_pos > 0.05) {
         if (sum_wh * sum_wa < 0.0) r.dir_flag = 1;
     }
     return r;
@@ -273,15 +299,19 @@ int main(int argc, char **argv)
                 if (cp.w0 < 5.0) cp.w0 = 5.0;
             }
 
-            // 人体输入: 20% 自激(零人力), 其余随机模式
+            // 人体输入: 20% 静止(自激测试), 其余为【阻抗跟踪周期性摆荡/屈伸】
             double u = U(rng);
-            if (u < 0.20) { hi.mode = 4; hi.amp = 0; hi.t_on = 0; hi.t_off = 1; hi.freq = 0; }
+            if (u < 0.20) { hi.mode = 4; hi.amp_pos = 0; hi.t_on = 0; hi.t_off = 1; hi.freq = 0;
+                            hi.Kh = 0; hi.Bh = 0; hi.tau_max = 0; }
             else {
-                hi.mode = (int)(U(rng) * 4);
-                hi.amp  = (2.0 * U(rng) - 1.0) * (5.0 + 25.0 * U(rng));  // ±5~30 N·m (真实人体范围)
-                hi.t_on = 0.2 * U(rng);
-                hi.t_off= hi.t_on + 0.3 + 1.2 * U(rng);
-                hi.freq = 0.5 + 2.0 * U(rng);
+                hi.mode    = (int)(U(rng) * 4);
+                hi.amp_pos = 0.2 + 0.8 * U(rng);      // 肢体摆幅 0.2~1.0 rad (11~57°)
+                hi.freq    = 0.5 + 2.0 * U(rng);      // 0.5~2.5 Hz (步行/摆臂频段)
+                hi.t_on    = 0.2 * U(rng);
+                hi.t_off   = 2.5;
+                hi.Kh      = 20.0 + 40.0 * U(rng);    // 人体关节刚度
+                hi.Bh      = 1.0 + 2.0 * U(rng);      // 人体关节阻尼
+                hi.tau_max = 20.0 + 20.0 * U(rng);    // 人体最大力矩 20~40 N·m
             }
             double th0_i = -0.5 + 1.0 * U(rng);
             double w0_i  = -0.5 + 1.0 * U(rng);
