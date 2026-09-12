@@ -248,6 +248,14 @@ void mode_handle_evt(uint8_t evt)
 
 void mode_request_switch(MainMode_e new_mode)
 {
+#if SDLOG_ZERO_ONLY
+    /* ★ SD 采集固件 (设计 v1.1 §0): 硬禁其余模式 —— 全程只允许 ZERO(零阻力),
+     *   确保连续采集期间不可能出现任何助力。 */
+    if (new_mode != MODE_ZERO_TORQUE) {
+        printf("[MODE] ★ SDLOG_ZERO_ONLY: 拒绝切换到 mode=%d (仅允许 ZERO)\r\n", (int)new_mode);
+        return;
+    }
+#endif
     if (new_mode == g_mode_mgr.main_mode) return;
 
     /* 1. 旧模式退出清理 */

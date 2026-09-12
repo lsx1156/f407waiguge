@@ -45,6 +45,7 @@
 #include "./BSP/SYS_INFO/sys_info.h"
 #include "./BSP/LCD_STATUS/lcd_status.h"
 #include "can_motor.h"
+#include "sd_log.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1048,6 +1049,12 @@ int main(void)
     #endif
 
     IWDG->KR = 0xAAAA;  /* 启动 MX_IWDG 前再喂一口 (防 HW IWDG 已启用时超时) */
+#if SDLOG_ENABLE
+    /* ---- SD 卡采集子系统: 上电即挂载并开始采集 (设计 v1.1) ----
+     * 放在 IWDG 启动之前: 挂载+吞吐自检可能耗时数百 ms, 避免撞狗 */
+    BOOT_TRACE("SDLOG: 初始化 SD 卡 (挂载 + 吞吐自检 + 新建日志)...");
+    (void)sdlog_init();
+#endif
     BOOT_TRACE("Starting IWDG (4s timeout, will reset if tasks stall)...");
     MX_IWDG_Init();
     BOOT_TRACE("IWDG: ENABLED (4s timeout)");
@@ -1104,6 +1111,9 @@ int main(void)
         network_task_run();
         control_task_run();
         eeprom_task_run();
+#if SDLOG_ENABLE
+        sdlog_task();               /* ★ SD 日志: 写出满块 + 周期 f_sync(2s) */
+#endif
 
         /* v1.2: LwIP 初始化失败自动重试 (每 5 秒一次)
          * PHY 冷启动偶发锁死, 重试可恢复 */

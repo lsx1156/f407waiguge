@@ -7,6 +7,7 @@
 #include "udp_protocol.h"
 #include "mode_manager.h"
 #include "joint_unit.h"
+#include "sd_log.h"
 #include <string.h>
 #include <math.h>
 
@@ -1041,6 +1042,9 @@ void control_isr_process(void)
     ReportFrame_t frame;
     report_frame_build(&frame, g_leg_status, g_arm_status);
     report_fifo_write(&frame);
+#if SDLOG_ENABLE
+    sdlog_push(&frame);          /* ★ SD 日志: 与 UDP 同帧入队 (纯内存拷贝, µs 级) */
+#endif
 
     HAL_GPIO_TogglePin(WDT_FEED_PORT, WDT_FEED_PIN);
 }

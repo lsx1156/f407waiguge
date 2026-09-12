@@ -245,6 +245,17 @@
 /* Kept for backward compatibility */
 #define MEM_TABLES_SIZE        MEM_TABLE_SIZE
 
+/* ========== SD 卡数据采集子系统 (v2.2.0) ==========
+ * SDLOG_ENABLE=1  上电即挂载 SD 并在 ZERO(零阻力) 模式下连续采集到 SD 卡
+ * SDLOG_ZERO_ONLY=1 硬禁 GAIT/ARM_ASSIST/INDUSTRIAL —— 采集期间不得有任何助力
+ *   (设计依据: docs/SD卡采集子系统设计_v1.md §0 v1.1) */
+#ifndef SDLOG_ENABLE
+#define SDLOG_ENABLE        1
+#endif
+#ifndef SDLOG_ZERO_ONLY
+#define SDLOG_ZERO_ONLY     1
+#endif
+
 /* ========== FIFO Configuration ========== */
 
 #define FIFO_REPORT_SIZE     128   /* ★ v2.1.1 (2026-09-12): 32→128. 1kHz 下原 32 帧仅 32ms
